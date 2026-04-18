@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    launchd agent for the Polymarket weather dashboard.
+
+    This is a TEMPLATE — do NOT load directly. Use:
+        ./deploy/install_dashboard_agent.sh
+    which fills in the two ${...} placeholders, copies the file to
+    ~/Library/LaunchAgents/, and loads it.
+
+    Placeholders:
+        ${REPO_ROOT}        absolute path to polymarket_strat root
+        ${TAILNET_IP}       this machine's tailnet IP (100.x.y.z)
+        ${STREAMLIT_BIN}    full path to streamlit binary (from `which streamlit`)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wonsang.polymarket-dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${STREAMLIT_BIN}</string>
+        <string>run</string>
+        <string>${REPO_ROOT}/tools/dashboard/app.py</string>
+        <string>--server.address</string>
+        <string>${TAILNET_IP}</string>
+        <string>--server.port</string>
+        <string>8501</string>
+        <string>--server.headless</string>
+        <string>true</string>
+        <string>--browser.gatherUsageStats</string>
+        <string>false</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${REPO_ROOT}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>${REPO_ROOT}/tools/dashboard/logs/dashboard.stdout</string>
+
+    <key>StandardErrorPath</key>
+    <string>${REPO_ROOT}/tools/dashboard/logs/dashboard.stderr</string>
+</dict>
+</plist>

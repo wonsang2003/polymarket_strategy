@@ -1,0 +1,68 @@
+[backtest] Discovering candidate wallets from live API...
+[backtest] Scoring 60 candidate wallets...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/__main__.py", line 3, in <module>
+    main()
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/main.py", line 173, in main
+    run_backtest(args.strategy, use_sample=args.sample)
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/main.py", line 87, in run_backtest
+    _print_json({"backtests": [asdict(result) for result in service.backtest(strategy_name)]})
+                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/application/service.py", line 37, in backtest
+    return [self.create_strategy(strategy_name).backtest()]
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/domain/strategies/whale_following.py", line 440, in backtest
+    whales = self.rank_whales(candidates)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/domain/strategies/whale_following.py", line 208, in rank_whales
+    whales = [score for score in (self.score_wallet(wallet) for wallet in wallets) if score is not None]
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/domain/strategies/whale_following.py", line 208, in <genexpr>
+    whales = [score for score in (self.score_wallet(wallet) for wallet in wallets) if score is not None]
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/domain/strategies/whale_following.py", line 155, in score_wallet
+    closed_positions = self.client.get_closed_positions(wallet)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/api.py", line 85, in get_closed_positions
+    self._get(
+  File "/Users/wonsangchang/Downloads/polymarket_strat/polymarket_strat/api.py", line 45, in _get
+    with urlopen(request, timeout=self.timeout_seconds, context=ctx) as response:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 1392, in https_open
+    return self.do_open(http.client.HTTPSConnection, req,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/urllib/request.py", line 1348, in do_open
+    r = h.getresponse()
+        ^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/http/client.py", line 1428, in getresponse
+    response.begin()
+  File "/opt/anaconda3/lib/python3.12/http/client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/http/client.py", line 292, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/socket.py", line 720, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/ssl.py", line 1251, in recv_into
+    return self.read(nbytes, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.12/ssl.py", line 1103, in read
+    return self._sslobj.read(len, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

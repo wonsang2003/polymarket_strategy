@@ -1,0 +1,22 @@
+[project]
+name = "polymarket-strat"
+version = "0.1.0"
+description = "Quantitative Polymarket prediction market trading system"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "py-clob-client",
+    "numpy>=1.26",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+weather = ["xarray>=2024.1", "cfgrib>=0.9.10"]
+bayesian = ["pymc>=5.10", "arviz>=0.17"]
+
+[project.scripts]
+polymarket-strat = "polymarket_strat.main:main"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["polymarket_strat*"]
