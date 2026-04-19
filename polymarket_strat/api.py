@@ -61,6 +61,31 @@ class PolymarketPublicClient:
     def get_market(self, market_id: str) -> dict[str, Any]:
         return dict(self._get(GAMMA_BASE_URL, f"/markets/{market_id}"))
 
+    def get_events(
+        self,
+        *,
+        limit: int = 500,
+        active: bool = True,
+        closed: bool | None = False,
+        order: str = "volume24hr",
+        ascending: bool = False,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Paginate Gamma `/events`. Each event groups child bracket markets,
+        so event-based scanning captures every child regardless of individual
+        market's 24h volume rank — avoids the pagination-depth filter that
+        dropped low-volume middle brackets (e.g. Tokyo 21/22°C for April 20)
+        when scanning the flat `/markets` feed."""
+        params = {
+            "limit": limit, "active": active, "closed": closed,
+            "order": order, "ascending": str(ascending).lower(), "offset": offset,
+        }
+        return list(self._get(GAMMA_BASE_URL, "/events", params))
+
+    def get_event(self, event_id: str | int) -> dict[str, Any]:
+        """Fetch a single event with its full child markets array embedded."""
+        return dict(self._get(GAMMA_BASE_URL, f"/events/{event_id}"))
+
     def get_market_holders(self, market: str, *, limit: int = 25) -> list[dict[str, Any]]:
         return list(
             self._get(

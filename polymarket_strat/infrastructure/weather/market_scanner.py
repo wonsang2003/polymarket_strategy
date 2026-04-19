@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -111,12 +111,25 @@ class WeatherMarketScanner:
         self.client = client
 
     def find_weather_bracket_markets(
-        self, *, page_size: int = 200, max_markets: int = 2000
+        self, *, page_size: int = 200, max_markets: int = 2000,
+        event_page_size: int = 500, max_events: int = 5000,
     ) -> list[BracketContract]:
-        """Scan active Polymarket markets for temperature bracket contracts.
+        """Scan active Polymarket weather bracket contracts via an event-first
+        discovery strategy, with a flat-`/markets` fallback for safety.
 
-        Paginates through markets using offset because weather markets are
-        niche and typically not in the top 200 by 24h volume.
+        WHY EVENT-FIRST (Apr 19 2026 pivot):
+        Polymarket bundles all brackets for a single resolution day into one
+        event (e.g. `highest-temperature-in-tokyo-on-april-20-2026` contains
+        ~11 child markets: 15°C, 16°C, 17°C ... 26°C-or-higher). The flat
+        `/markets?order=volume24hr` feed only surfaces child markets that
+        rank high by 24h volume — low-volume middle brackets (21°C, 22°C
+        for Tokyo Apr 20) can fall off past offset=3000 even though they
+        are fully open and tradeable. Querying `/events` and walking each
+        event's `markets` array captures every bracket regardless of rank.
+
+        The flat-markets scan is retained as a union fallback so any
+        non-standard events (e.g. legacy question templates without the
+        "temperature" keyword in slug/title) are not missed.
 
         Handles two market formats:
         - Binary Yes/No: bracket is embedded in the question text.
@@ -124,6 +137,55 @@ class WeatherMarketScanner:
 
         Returns one BracketContract per tradeable bracket.
         """
+        # --- Phase 1: event-based discovery ---------------------------------
+        weather_markets: dict[str, dict] = {}  # key=conditionId (fallback=id)
+        events_scanned = 0
+        events_matched = 0
+        try:
+            ev_offset = 0
+            while ev_offset < max_events:
+                try:
+                    ev_batch = self.client.get_events(
+                        limit=event_page_size, active=True, closed=False, offset=ev_offset
+                    )
+                except Exception as exc:
+                    print(f"[scanner] Warning: /events fetch at offset={ev_offset} failed: {exc}", file=sys.stderr)
+                    break
+                if not ev_batch:
+                    break
+                events_scanned += len(ev_batch)
+                for ev in ev_batch:
+                    title = str(ev.get("title") or "").lower()
+                    slug = str(ev.get("slug") or "").lower()
+                    # Only enumerate children of events that look weather-related.
+                    # "temperature" hits the standard Polymarket slug pattern
+                    # (highest-temperature-in-<city>-on-<date>); "weather" is a
+                    # defensive catch-all for future templates.
+                    if not any(kw in title or kw in slug for kw in _WEATHER_KEYWORDS):
+                        continue
+                    events_matched += 1
+                    children = ev.get("markets") or []
+                    # If list response omits embedded children, hydrate the event.
+                    if not children:
+                        try:
+                            hydrated = self.client.get_event(ev.get("id"))
+                            children = hydrated.get("markets") or []
+                        except Exception as exc:
+                            print(f"[scanner] Warning: hydrate event {ev.get('id')} failed: {exc}", file=sys.stderr)
+                            continue
+                    for child in children:
+                        cid = str(child.get("conditionId") or child.get("id") or "")
+                        if cid:
+                            weather_markets[cid] = child
+                if len(ev_batch) < event_page_size:
+                    break
+                ev_offset += event_page_size
+        except Exception as exc:
+            print(f"[scanner] Warning: event-based discovery failed entirely: {exc}. Falling back to flat /markets scan.", file=sys.stderr)
+
+        # --- Phase 2: flat /markets safety-net fallback ---------------------
+        # Union with any markets that don't surface through /events matching.
+        # Covers legacy events without a "temperature" keyword or tag drift.
         all_markets: list[dict] = []
         offset = 0
         while offset < max_markets:
@@ -132,7 +194,7 @@ class WeatherMarketScanner:
                     limit=page_size, active=True, order="volume24hr", offset=offset
                 )
             except Exception as exc:
-                print(f"[scanner] Warning: fetch at offset={offset} failed: {exc}", file=sys.stderr)
+                print(f"[scanner] Warning: /markets fetch at offset={offset} failed: {exc}", file=sys.stderr)
                 break
             if not batch:
                 break
@@ -140,10 +202,20 @@ class WeatherMarketScanner:
             if len(batch) < page_size:
                 break
             offset += page_size
+        for m in all_markets:
+            cid = str(m.get("conditionId") or m.get("id") or "")
+            if cid and cid not in weather_markets:
+                weather_markets[cid] = m
+
+        print(
+            f"[scanner] Event discovery: scanned {events_scanned} events, matched {events_matched} weather events. "
+            f"Flat scan: {len(all_markets)} markets. Union after dedup: {len(weather_markets)} candidate markets.",
+            file=sys.stderr,
+        )
 
         contracts: list[BracketContract] = []
 
-        for market in all_markets:
+        for market in weather_markets.values():
             question = str(market.get("question") or market.get("title") or "")
             lower_q = question.lower()
 
@@ -164,15 +236,51 @@ class WeatherMarketScanner:
             if not station:
                 continue
 
-            # Skip if the daily high is already settled.
-            # After 16:00 local time at the station, only trade tomorrow+.
-            # Before 16:00, same-day contracts are still live.
-            # For multi-day contracts, use end_date for the cutoff check.
-            station_now = datetime.now(ZoneInfo(station.timezone))
-            cutoff_passed = station_now.hour >= 16
-            min_trade_date = station_now.date() + timedelta(days=1 if cutoff_passed else 0)
-            relevant_date = end_date if end_date else target_date
-            if relevant_date < min_trade_date:
+            # Prefer Polymarket's authoritative market state over our heuristic.
+            # Gamma API exposes `closed`, `acceptingOrders`, `endDate` / `endDateIso`.
+            # These tell us exactly when a market stops trading; fall back to the
+            # 16:00 local-station heuristic only when those fields are missing.
+            if market.get("closed") or market.get("archived"):
+                continue
+            if market.get("acceptingOrders") is False:
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+            # NOTE: Polymarket's `endDate` field is date-only (e.g. "2026-04-19"),
+            # which parses as midnight UTC on that day. Using it as the close
+            # timestamp caused the scanner to treat every resolution-day market
+            # as "already closed" for the first 16+ hours of UTC (i.e. entire
+            # Asia/Europe trading window), silently dropping today's contracts.
+            # Polymarket actually keeps trading open until the station-local
+            # daily-high cutoff (~16:00 local). Only accept fields that carry a
+            # real time component; fall back to the 16:00-station-local heuristic
+            # when a timestamp is absent.
+            end_raw = market.get("endDateIso") or market.get("end_date_iso")
+            market_end: datetime | None = None
+            if end_raw and "T" in str(end_raw):
+                try:
+                    market_end = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                    if market_end.tzinfo is None:
+                        market_end = market_end.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    market_end = None
+
+            if market_end is not None:
+                # Authoritative close time — skip if the market has already ended.
+                if market_end <= now_utc:
+                    continue
+            else:
+                # Fallback: 16:00 station-local heuristic for "daily high probably set."
+                station_now = datetime.now(ZoneInfo(station.timezone))
+                cutoff_passed = station_now.hour >= 16
+                min_trade_date = station_now.date() + timedelta(days=1 if cutoff_passed else 0)
+                relevant_date = end_date if end_date else target_date
+                if relevant_date < min_trade_date:
+                    continue
+
+            # Always drop contracts whose resolution date is already in the past,
+            # even if Polymarket hasn't flipped `closed` yet (resolution lag).
+            if (end_date if end_date else target_date) < now_utc.date() - timedelta(days=1):
                 continue
 
             outcomes = _parse_stringified(market.get("outcomes"))
