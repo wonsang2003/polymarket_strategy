@@ -148,23 +148,32 @@ def _load_errors_with_dates(
     db: WeatherDatabase,
     city: str,
     model: WeatherModel,
-) -> list[tuple[float, date]]:
-    """Return (error_f, obs_date) tuples, bypassing the filtered accessor.
+) -> list[tuple[float, date, str]]:
+    """Return (error_f, obs_date, regime) triples, bypassing the filtered accessor.
 
-    We need the date alongside the error value to filter train < D.
+    We need the date alongside the error value to filter train < D, and the
+    regime label to fit per-regime distributions for regime-aware inference.
     """
     rows = db._conn.execute(
-        "SELECT error_f, obs_date FROM forecast_errors WHERE city = ? AND model = ? ORDER BY obs_date",
+        "SELECT error_f, obs_date, regime FROM forecast_errors WHERE city = ? AND model = ? ORDER BY obs_date",
         (city, model.value),
     ).fetchall()
-    out: list[tuple[float, date]] = []
+    out: list[tuple[float, date, str]] = []
     for r in rows:
         try:
             d = date.fromisoformat(r["obs_date"])
         except (TypeError, ValueError):
             continue
-        out.append((float(r["error_f"]), d))
+        regime = r["regime"] if r["regime"] else SynopticRegime.STABLE_HIGH.value
+        out.append((float(r["error_f"]), d, regime))
     return out
+
+
+def _regime_from_str(s: str) -> SynopticRegime:
+    try:
+        return SynopticRegime(s)
+    except ValueError:
+        return SynopticRegime.STABLE_HIGH
 
 
 def _load_forecast_on_date(
@@ -238,13 +247,38 @@ def walk_forward_city_model(
     min_train: int = 30,
     lead_hours: int = 24,
     use_bayesian: bool = False,
+    regime_aware: bool = True,
 ) -> tuple[list[WalkForwardResult], dict[str, int]]:
-    """Walk from `start` to `end`, day by day."""
+    """Walk from `start` to `end`, day by day.
+
+    When ``regime_aware=True``: at each eval date D we (a) fit one distribution
+    per regime from training errors labeled with that regime, and (b) look up
+    the eval date's regime label to pick the matching distribution. When a
+    regime has fewer than ``min_train`` samples we fall back to STABLE_HIGH
+    (and if that's also insufficient, to the pooled fit of all available train
+    errors). This mirrors how live inference will work once regime
+    classification is wired into ``WeatherBracketStrategy``.
+
+    LEAKAGE NOTE: the eval-date regime label stored in ``forecast_errors`` was
+    computed by ``scripts/backfill_regimes.py`` using ERA5 reanalysis for that
+    date (CAPE max + pressure tendency) — i.e. post-event data. Using it at
+    inference therefore measures a *calibration ceiling* ("if we had a perfect
+    regime classifier at forecast time, what's the best Brier we could hit?").
+    It is NOT a strict out-of-sample test. The honest version will substitute
+    a forecast-time classifier (ensemble spread, forecast CAPE max, forecast
+    pressure tendency) once the ensemble-api back-fetch lands.
+
+    Setting ``regime_aware=False`` reproduces the prior pooled-fit behavior
+    for A/B comparison.
+    """
     errors = _load_errors_with_dates(db, city, model)
     if not errors:
         return [], {"total_dates": 0, "no_errors_at_all": 1, "skipped_insufficient_train": 0,
                     "skipped_no_forecast": 0, "skipped_no_obs": 0, "skipped_fit_error": 0,
                     "evaluated": 0}
+
+    # Fast map (obs_date -> regime) for eval-date lookup
+    regime_by_date: dict[date, str] = {dd: r for (_, dd, r) in errors}
 
     fitter = ErrorDistributionFitter()
     calc = BracketProbabilityCalculator()
@@ -255,7 +289,8 @@ def walk_forward_city_model(
     while d <= end:
         skip["total_dates"] += 1
         # Training set: all errors with obs_date strictly before d
-        train_errors = [e for (e, dd) in errors if dd < d]
+        train_rows = [(e, r) for (e, dd, r) in errors if dd < d]
+        train_errors = [e for (e, _) in train_rows]
         if len(train_errors) < min_train:
             skip["skipped_insufficient_train"] += 1
             d += timedelta(days=1)
@@ -276,22 +311,67 @@ def walk_forward_city_model(
             continue
         observed_f = float(obs_row["observed_high_f"])
 
-        # Fit distribution
+        # Fit distribution(s)
+        dists_by_regime: dict[str, ErrorDistribution] = {}
+        pooled_dist: ErrorDistribution | None = None
         try:
+            if regime_aware:
+                # Bucket train rows by regime
+                by_regime: dict[str, list[float]] = defaultdict(list)
+                for e, r in train_rows:
+                    by_regime[r].append(e)
+                for regime_str, regime_errs in by_regime.items():
+                    if len(regime_errs) < min_train:
+                        continue
+                    regime_enum = _regime_from_str(regime_str)
+                    try:
+                        if use_bayesian:
+                            posterior = fitter.fit_bayesian(
+                                regime_errs, city=city, model=model,
+                                regime=regime_enum, lead_hours=lead_hours,
+                            )
+                            dists_by_regime[regime_str] = fitter.summarize_posterior(posterior)  # type: ignore[attr-defined]
+                        else:
+                            dists_by_regime[regime_str] = fitter.fit(
+                                regime_errs, city=city, model=model,
+                                regime=regime_enum, lead_hours=lead_hours,
+                            )
+                    except Exception as exc:
+                        print(f"  [{d}] regime {regime_str} fit error: {exc}", file=sys.stderr)
+
+            # Always keep a pooled fallback in case a regime has <min_train samples
             if use_bayesian:
                 posterior = fitter.fit_bayesian(
                     train_errors, city=city, model=model,
                     regime=SynopticRegime.STABLE_HIGH, lead_hours=lead_hours,
                 )
-                dist = fitter.summarize_posterior(posterior)  # type: ignore[attr-defined]
+                pooled_dist = fitter.summarize_posterior(posterior)  # type: ignore[attr-defined]
             else:
-                dist = fitter.fit(
+                pooled_dist = fitter.fit(
                     train_errors, city=city, model=model,
                     regime=SynopticRegime.STABLE_HIGH, lead_hours=lead_hours,
                 )
         except Exception as exc:
             skip["skipped_fit_error"] += 1
             print(f"  [{d}] fit error: {exc}", file=sys.stderr)
+            d += timedelta(days=1)
+            continue
+
+        # Pick which distribution to use at inference
+        if regime_aware:
+            eval_regime = regime_by_date.get(d, SynopticRegime.STABLE_HIGH.value)
+            dist = dists_by_regime.get(eval_regime)
+            if dist is None:
+                # Fallback priority: STABLE_HIGH regime fit → pooled fit
+                dist = dists_by_regime.get(SynopticRegime.STABLE_HIGH.value) or pooled_dist
+                skip["fallback_to_pooled"] += 1
+            else:
+                skip[f"regime_{eval_regime}"] += 1
+        else:
+            dist = pooled_dist
+
+        if dist is None:
+            skip["skipped_fit_error"] += 1
             d += timedelta(days=1)
             continue
 
@@ -440,6 +520,9 @@ def main() -> int:
     parser.add_argument("--lead-hours", type=int, default=24, help="Forecast lead to use (default 24)")
     parser.add_argument("--bayesian", action="store_true",
                         help="Use fit_bayesian() + summarize_posterior() (PyMC, slow)")
+    parser.add_argument("--pooled", action="store_true",
+                        help="Disable regime-aware fit; reproduce the pre-backfill pooled-fit behavior "
+                             "for A/B comparison")
     parser.add_argument("--csv", type=Path, help="Optional CSV of per-date per-bracket rows")
     args = parser.parse_args()
 
@@ -482,13 +565,14 @@ def main() -> int:
         for city in cities:
             for model in models:
                 print(f"\n[walk-forward] {city:<14} {model.value:<6}  {start} → {end}  "
-                      f"bayes={args.bayesian}")
+                      f"bayes={args.bayesian}  regime_aware={not args.pooled}")
                 results, skips = walk_forward_city_model(
                     db, city, model,
                     start=start, end=end,
                     min_train=args.min_train,
                     lead_hours=args.lead_hours,
                     use_bayesian=args.bayesian,
+                    regime_aware=not args.pooled,
                 )
                 all_results.extend(results)
                 per_cm_summary[(city, model.value)] = summarize(results)
@@ -502,6 +586,7 @@ def main() -> int:
     print(f"Window:        {start} → {end}")
     print(f"Min-train:     {args.min_train}")
     print(f"Bayesian:      {args.bayesian}")
+    print(f"Regime-aware:  {not args.pooled}")
     print(f"Bracket shapes: {[s.name for s in BRACKET_SHAPES]}")
 
     print(f"\n--- Per (city, model) summary ---")

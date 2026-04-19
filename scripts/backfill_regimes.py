@@ -34,6 +34,8 @@ Flags
     --refit                         After backfill, re-fit error_distributions
     --db PATH                       Override DB path (default: data/weather/weather.db)
     --chunk-days N                  Ensemble-fetch window size (default: 30)
+    --lead-hours {6,12,24,48,72}    Restrict query + UPDATE to one lead bucket
+                                    (default: all leads)
 
 Typical run
 -----------
@@ -46,6 +48,10 @@ Typical run
     # Real run, all cities, with refit, explicit window:
     python scripts/backfill_regimes.py \
         --start 2025-01-01 --end 2026-04-10 --refit
+
+    # Fix the remaining 48h STABLE_HIGH gap (CLAUDE.md §14 #1) without
+    # overwriting already-correct 24h labels:
+    python scripts/backfill_regimes.py --lead-hours 48 --refit
 
 Notes
 -----
@@ -137,17 +143,17 @@ def fetch_ensemble_members_ranged(
     start: date,
     end: date,
 ) -> dict[date, list[float]]:
-    """Fetch ensemble member daily-max-temperature forecasts for a date range.
+    """Fetch daily-max-temperature forecasts for a date range.
 
-    Returns {obs_date: [member_1_f, member_2_f, ...]} with up to 82 members
-    (31 GFS + 51 ECMWF) per date.
+    Returns {obs_date: [gfs_val_f, ecmwf_val_f]} — a 2-member "duo" pulled from
+    archive-api's deterministic runs. True 31+51 member ensemble would require
+    ensemble-api which only retains ~60–90 days of history; archive-api goes
+    back years but only exposes the mean deterministic forecast per model.
 
-    YOU IMPLEMENT (minor): confirm Open-Meteo's ensemble-api response shape for
-    multi-day ranges. Their docs describe per-key-suffixed columns like
-    `temperature_2m_max_member01`, `temperature_2m_max_member02`, ... one row
-    per day. The parser below follows that convention — if their format has
-    drifted, adjust the key-prefix match (search for
-    `key.startswith("temperature_2m_max")`).
+    Downstream: `classify_from_ensemble(n_members=2)` auto-falls back to
+    `classify_from_spread` (see calibration.py:296-298). `compute_regime_for_date`
+    additionally consults CAPE + pressure tendency to promote duo classifications
+    into CONVECTIVE / TRANSITION when appropriate.
     """
     out: dict[date, list[float]] = defaultdict(list)
 
@@ -163,10 +169,10 @@ def fetch_ensemble_members_ranged(
             "end_date": end.isoformat(),
         }
         try:
-            data = _http_get_json(_OM_ENSEMBLE_URL, params)
+            data = _http_get_json(_OM_ARCHIVE_URL, params)
         except Exception as exc:
             print(
-                f"  [ensemble:{om_model}] {station.city} {start}→{end}: {exc}",
+                f"  [archive:{om_model}] {station.city} {start}→{end}: {exc}",
                 file=sys.stderr,
             )
             continue
@@ -174,14 +180,9 @@ def fetch_ensemble_members_ranged(
 
         daily = data.get("daily", {})
         dates_list: list[str] = daily.get("time", []) or []
-        # Each ensemble member appears as a separate key
-        # (temperature_2m_max_member01, ..._member30, etc).
-        member_series: list[list[float | None]] = []
-        for key, values in daily.items():
-            if key.startswith("temperature_2m_max") and isinstance(values, list):
-                member_series.append(values)
-
-        if not member_series or not dates_list:
+        # Deterministic archive runs return a single scalar series
+        values = daily.get("temperature_2m_max", []) or []
+        if not dates_list or not values:
             continue
 
         for i, d_str in enumerate(dates_list):
@@ -189,11 +190,68 @@ def fetch_ensemble_members_ranged(
                 d = date.fromisoformat(d_str)
             except ValueError:
                 continue
-            for series in member_series:
-                if i < len(series) and series[i] is not None:
-                    out[d].append(float(series[i]))
+            if i < len(values) and values[i] is not None:
+                out[d].append(float(values[i]))
 
     return dict(out)
+
+
+def fetch_pressure_tendency_ranged(
+    station: CityStation,
+    *,
+    start: date,
+    end: date,
+) -> dict[date, float]:
+    """Fetch max |dP/dt over 12h| per day from ERA5 archive.
+
+    TRANSITION regime per CLAUDE.md §5.6 requires |dP/dt| > 4 hPa / 12h.
+    We fetch hourly `pressure_msl`, compute rolling 12h absolute deltas, and
+    report the max per local date. Returns {obs_date: max_abs_delta_hpa}.
+    """
+    params = {
+        "latitude": station.lat,
+        "longitude": station.lon,
+        "hourly": "pressure_msl",
+        "models": _ARCHIVE_MODEL_FOR_CAPE,
+        "timezone": station.timezone,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+    }
+    try:
+        data = _http_get_json(_OM_ARCHIVE_URL, params)
+    except Exception as exc:
+        print(f"  [pmsl] {station.city} {start}→{end}: {exc}", file=sys.stderr)
+        return {}
+    time.sleep(_REQUEST_SLEEP)
+
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", []) or []
+    pressures = hourly.get("pressure_msl", []) or []
+    if len(times) != len(pressures):
+        return {}
+
+    # Parse once
+    parsed: list[tuple[date, datetime, float]] = []
+    for t_str, p in zip(times, pressures):
+        if p is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(t_str)
+        except ValueError:
+            continue
+        parsed.append((dt.date(), dt, float(p)))
+
+    # Rolling 12h delta: for each hour i, compare to i-12.
+    # Map back to the date of the *later* sample (the transition "belongs" to that day).
+    daily_max: dict[date, float] = {}
+    for i in range(12, len(parsed)):
+        d_later, _, p_later = parsed[i]
+        _, _, p_prior = parsed[i - 12]
+        delta = abs(p_later - p_prior)
+        if delta > daily_max.get(d_later, 0.0):
+            daily_max[d_later] = delta
+
+    return daily_max
 
 
 def fetch_cape_max_ranged(
@@ -252,29 +310,61 @@ def compute_regime_for_date(
     *,
     members: list[float],
     cape_max: float,
+    pressure_tendency_hpa_12h: float,
+    pressure_frontal_threshold_hpa: float,
+    pressure_transition_threshold_hpa: float,
     classifier: RegimeClassifier,
 ) -> SynopticRegime:
-    """Classify one date's regime from its ensemble members + CAPE."""
-    if len(members) < 3:
-        return SynopticRegime.STABLE_HIGH
+    """Classify one date's regime from pressure-tendency tiers + CAPE + spread.
 
-    mean_val = statistics.fmean(members)
-    std_val = statistics.stdev(members) if len(members) >= 2 else 0.0
-    spread_val = max(members) - min(members)
+    Priority order (derived from CLAUDE.md §5.6, tuned for deterministic duo):
+      1. CAPE > 1000 J/kg                                                → CONVECTIVE
+      2. |dP/dt_12h| > pressure_frontal_threshold_hpa (top ~5%)          → FRONTAL_PASSAGE
+      3. |dP/dt_12h| > pressure_transition_threshold_hpa (next ~12%)     → TRANSITION
+      4. duo spread > 7.2°F (both determ. models disagree strongly)      → FRONTAL_PASSAGE
+      5. else                                                            → STABLE_HIGH
 
-    n = len(members)
-    if std_val > 0 and n >= 3:
-        skew = sum(((x - mean_val) / std_val) ** 3 for x in members) * n / ((n - 1) * (n - 2))
-    else:
-        skew = 0.0
+    Why tier pressure-tendency for BOTH frontal and transition:
+      - A real 82-member ensemble would give real temperature spread, but
+        ensemble-api's retention (~60-90 days) cuts off calibration windows.
+        `fetch_ensemble_members_ranged` therefore returns the GFS+ECMWF
+        deterministic duo from archive-api. Two deterministics rarely disagree
+        by more than 7.2°F, so `classify_from_spread`'s FRONTAL branch almost
+        never fires for the duo — leaving FRONTAL share ≈ 0 for quiet climates
+        (verified: London/NYC dry-runs show 0% FRONTAL under spread rule).
+      - The largest frontal passages in mid-latitudes ARE the days with the
+        biggest pressure changes — synoptic-scale cyclogenesis drives both.
+        Tiering |dP/dt_12h| gives us a direct, non-degenerate frontal signal.
+      - The spread-rule FRONTAL fallback (step 4) still catches the rare days
+        where pressure stayed calm but the two models diverge on temperature
+        (e.g. marine-layer timing).
 
-    return classifier.classify_from_ensemble(
-        spread_f=spread_val,
-        std_f=std_val,
-        skewness=skew,
-        cape_max=cape_max,
-        n_members=n,
-    )
+    Both thresholds are computed per-city in `backfill_one_city` from this
+    window's pressure climatology (percentiles 95 and 83 of the daily
+    max |dP/dt_12h|), so the calibration is robust across tropical/temperate/
+    subarctic cities without hand-tuning.
+    """
+    # Priority 1: convective — overrides everything
+    if cape_max > 1000.0:
+        return SynopticRegime.CONVECTIVE
+
+    # Priority 2: most extreme pressure change → frontal passage
+    abs_dpdt = abs(pressure_tendency_hpa_12h)
+    if abs_dpdt > pressure_frontal_threshold_hpa:
+        return SynopticRegime.FRONTAL_PASSAGE
+
+    # Priority 3: moderate pressure change → synoptic transition
+    if abs_dpdt > pressure_transition_threshold_hpa:
+        return SynopticRegime.TRANSITION
+
+    # Priority 4: strong duo-spread disagreement → frontal (rare with duo)
+    if len(members) >= 2:
+        spread_val = max(members) - min(members)
+        if spread_val > 7.2:
+            return SynopticRegime.FRONTAL_PASSAGE
+
+    # Priority 5: default
+    return SynopticRegime.STABLE_HIGH
 
 
 # ---------------------------------------------------------------------------
@@ -287,20 +377,29 @@ def query_dates_to_backfill(
     city: str,
     start: date,
     end: date,
+    lead_hours: int | None = None,
 ) -> list[date]:
-    """Return distinct obs_dates for this city where regime is still 'stable_high'."""
-    rows = db._conn.execute(
-        """
-        SELECT DISTINCT obs_date
-        FROM forecast_errors
-        WHERE city = ?
-          AND regime = 'stable_high'
-          AND obs_date >= ?
-          AND obs_date <= ?
-        ORDER BY obs_date
-        """,
-        (city, start.isoformat(), end.isoformat()),
-    ).fetchall()
+    """Return distinct obs_dates for this city where regime is still 'stable_high'.
+
+    If lead_hours is supplied, restrict to rows at that exact lead bucket —
+    crucial so a 48h-only backfill doesn't sweep up obs_dates that have correctly
+    classified 24h rows (CLAUDE.md §14 #1: 24h buckets already have frontal/
+    transition labels from live calibration; only 48h is stuck at stable_high).
+    """
+    sql = (
+        "SELECT DISTINCT obs_date "
+        "FROM forecast_errors "
+        "WHERE city = ? "
+        "  AND regime = 'stable_high' "
+        "  AND obs_date >= ? "
+        "  AND obs_date <= ? "
+    )
+    params: list[object] = [city, start.isoformat(), end.isoformat()]
+    if lead_hours is not None:
+        sql += "  AND lead_hours = ? "
+        params.append(int(lead_hours))
+    sql += "ORDER BY obs_date"
+    rows = db._conn.execute(sql, params).fetchall()
     out: list[date] = []
     for r in rows:
         try:
@@ -316,17 +415,19 @@ def update_regime_for_date(
     city: str,
     obs_date: date,
     regime: SynopticRegime,
+    lead_hours: int | None = None,
 ) -> int:
-    """UPDATE forecast_errors for (city, obs_date) — returns row count changed."""
-    cur = db._conn.execute(
-        """
-        UPDATE forecast_errors
-        SET regime = ?
-        WHERE city = ?
-          AND obs_date = ?
-        """,
-        (regime.value, city, obs_date.isoformat()),
-    )
+    """UPDATE forecast_errors for (city, obs_date) — returns row count changed.
+
+    If lead_hours is supplied, restrict the UPDATE to that exact bucket so a
+    48h backfill leaves already-correct 24h labels intact.
+    """
+    sql = "UPDATE forecast_errors SET regime = ? WHERE city = ? AND obs_date = ?"
+    params: list[object] = [regime.value, city, obs_date.isoformat()]
+    if lead_hours is not None:
+        sql += " AND lead_hours = ?"
+        params.append(int(lead_hours))
+    cur = db._conn.execute(sql, params)
     return cur.rowcount
 
 
@@ -387,36 +488,86 @@ def backfill_one_city(
     chunk_days: int,
     classifier: RegimeClassifier,
     dry_run: bool,
+    lead_hours: int | None = None,
 ) -> dict[str, int]:
-    """Classify and (unless dry_run) relabel every stable_high row for this city."""
+    """Classify and (unless dry_run) relabel every stable_high row for this city.
+
+    When lead_hours is provided, the query/update are scoped to that single
+    lead bucket — use this for a 48h-only backfill that preserves 24h labels.
+    """
     station = CITY_REGISTRY.get(city)
     if station is None:
         print(f"[{city}] unknown city — skipping", file=sys.stderr)
         return {"skipped": 1}
 
-    dates_to_backfill = query_dates_to_backfill(db, city=city, start=start, end=end)
+    dates_to_backfill = query_dates_to_backfill(
+        db, city=city, start=start, end=end, lead_hours=lead_hours,
+    )
     if not dates_to_backfill:
-        print(f"[{city}] nothing to backfill (0 stable_high rows in window)", file=sys.stderr)
+        scope = f"lead={lead_hours}h" if lead_hours is not None else "all leads"
+        print(
+            f"[{city}] nothing to backfill (0 stable_high rows in window, {scope})",
+            file=sys.stderr,
+        )
         return {"dates_processed": 0}
 
     earliest, latest = dates_to_backfill[0], dates_to_backfill[-1]
+    scope = f"lead={lead_hours}h" if lead_hours is not None else "all leads"
     print(
         f"[{city}] {len(dates_to_backfill)} distinct dates to classify "
-        f"({earliest} → {latest})",
+        f"({earliest} → {latest}, {scope})",
         file=sys.stderr,
     )
 
-    # Batch ensemble fetches by chunk
+    # Batch archive fetches by chunk
     members_by_date: dict[date, list[float]] = {}
     cape_by_date: dict[date, float] = {}
+    pressure_by_date: dict[date, float] = {}
     for c_start, c_end in chunk_date_range(earliest, latest, chunk_days=chunk_days):
-        print(f"  fetching ensemble + CAPE for {c_start} → {c_end}...", file=sys.stderr)
+        print(
+            f"  fetching duo + CAPE + pressure for {c_start} → {c_end}...",
+            file=sys.stderr,
+        )
         members_by_date.update(
             fetch_ensemble_members_ranged(station, start=c_start, end=c_end)
         )
         cape_by_date.update(
             fetch_cape_max_ranged(station, start=c_start, end=c_end)
         )
+        pressure_by_date.update(
+            fetch_pressure_tendency_ranged(station, start=c_start, end=c_end)
+        )
+
+    # Derive per-city FRONTAL and TRANSITION pressure-tendency thresholds from
+    # this window's pressure climatology (§5.6 target: frontal 5-15%, transition
+    # 10-20%). We target the top 5% as FRONTAL and the next 12% (p83-p95) as
+    # TRANSITION. Absolute floors of 8 / 4 hPa are retained so tropical stations
+    # with very quiet pressure climatologies never get spuriously-labeled days.
+    _frontal_floor = 8.0
+    _transition_floor = 4.0
+    _frontal_percentile = 95.0
+    _transition_percentile = 83.0
+    if pressure_by_date:
+        _pressures_sorted = sorted(pressure_by_date.values())
+
+        def _pct(p: float) -> float:
+            idx = int(len(_pressures_sorted) * p / 100.0)
+            idx = max(0, min(idx, len(_pressures_sorted) - 1))
+            return _pressures_sorted[idx]
+
+        pressure_frontal_threshold_hpa = max(_frontal_floor, _pct(_frontal_percentile))
+        pressure_transition_threshold_hpa = max(
+            _transition_floor, _pct(_transition_percentile)
+        )
+    else:
+        pressure_frontal_threshold_hpa = _frontal_floor
+        pressure_transition_threshold_hpa = _transition_floor
+    print(
+        f"[{city}] pressure thresholds: frontal={pressure_frontal_threshold_hpa:.2f} hPa "
+        f"(p{int(_frontal_percentile)}), transition={pressure_transition_threshold_hpa:.2f} hPa "
+        f"(p{int(_transition_percentile)}) over {len(pressure_by_date)} daily max |dP/dt_12h|",
+        file=sys.stderr,
+    )
 
     # Classify every date
     regime_counts: Counter[SynopticRegime] = Counter()
@@ -424,8 +575,14 @@ def backfill_one_city(
     for d in dates_to_backfill:
         members = members_by_date.get(d, [])
         cape = cape_by_date.get(d, 0.0)
+        pressure_tendency = pressure_by_date.get(d, 0.0)
         regime = compute_regime_for_date(
-            members=members, cape_max=cape, classifier=classifier
+            members=members,
+            cape_max=cape,
+            pressure_tendency_hpa_12h=pressure_tendency,
+            pressure_frontal_threshold_hpa=pressure_frontal_threshold_hpa,
+            pressure_transition_threshold_hpa=pressure_transition_threshold_hpa,
+            classifier=classifier,
         )
         regime_counts[regime] += 1
         if regime is not SynopticRegime.STABLE_HIGH:
@@ -448,7 +605,7 @@ def backfill_one_city(
     try:
         for d, regime in updates:
             rows_changed += update_regime_for_date(
-                db, city=city, obs_date=d, regime=regime
+                db, city=city, obs_date=d, regime=regime, lead_hours=lead_hours,
             )
         db._conn.commit()
     except Exception as exc:
@@ -535,6 +692,17 @@ def parse_args() -> argparse.Namespace:
                    help="Path to weather.db (default: data/weather/weather.db).")
     p.add_argument("--chunk-days", type=int, default=30,
                    help="Ensemble-fetch chunk size (default: 30).")
+    p.add_argument(
+        "--lead-hours",
+        type=int,
+        default=None,
+        choices=[6, 12, 24, 48, 72],
+        help=(
+            "Only backfill rows at this exact lead bucket. "
+            "Use --lead-hours 48 to fix the 48h STABLE_HIGH gap without "
+            "disturbing already-correct 24h regime labels. Default: all leads."
+        ),
+    )
     return p.parse_args()
 
 
@@ -552,8 +720,10 @@ def main() -> int:
     db = WeatherDatabase(args.db)
     classifier = RegimeClassifier()
 
+    lead_scope = f"lead={args.lead_hours}h only" if args.lead_hours else "all leads"
     print(
         f"backfill_regimes: {len(cities)} cities, window {start} → {end}, "
+        f"{lead_scope}, "
         f"{'DRY RUN' if args.dry_run else 'LIVE'}"
         f"{' + refit' if args.refit and not args.dry_run else ''}",
         file=sys.stderr,
@@ -570,6 +740,7 @@ def main() -> int:
             chunk_days=args.chunk_days,
             classifier=classifier,
             dry_run=args.dry_run,
+            lead_hours=args.lead_hours,
         )
         per_city[city] = res
         for k, v in res.items():

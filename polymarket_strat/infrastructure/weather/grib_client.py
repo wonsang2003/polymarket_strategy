@@ -238,7 +238,10 @@ class GribDataClient:
         Note: HRRR is CONUS-only. Returns None for non-US cities.
         """
         us_groups = {"us_northeast", "us_west", "us_south"}
-        if station.correlation_group.value not in us_groups:
+        # mexico_city is tagged US_SOUTH for correlation-group/risk purposes
+        # but sits at 19.44°N — outside HRRR's CONUS grid (~21°N–50°N).
+        # Open-Meteo returns HTTP 400 for its coords. Skip.
+        if station.correlation_group.value not in us_groups or station.city == "mexico_city":
             return None
         return self._fetch_open_meteo(
             station, WeatherModel.HRRR, init_time=init_time, lead_hours=min(lead_hours, 48)
@@ -410,6 +413,7 @@ class GribDataClient:
         *,
         start: date,
         end: date,
+        lead_days: int = 1,
     ) -> dict[date, float]:
         """Fetch archived model forecasts from Open-Meteo previous-runs API.
 
@@ -417,45 +421,96 @@ class GribDataClient:
         this fetches what the model ACTUALLY PREDICTED — enabling true
         forecast-vs-observation error calibration over long periods.
 
+        `lead_days` selects which previous run is returned:
+          - 1 → forecast issued ~24h before each valid date (24h lead)
+          - 2 → forecast issued ~48h before each valid date (48h lead)
+          - 3 → forecast issued ~72h before each valid date (72h lead)
+
+        Open-Meteo's previous-runs API only exposes the `_previous_dayN` suffix
+        on **hourly** variables (not daily aggregates), so for lead_days >= 2
+        we fetch hourly `temperature_2m_previous_day{N-1}`, group by station-
+        local date (the API already returns timestamps in station TZ because
+        we pass `timezone=station.timezone`), and take the max per local day.
+        For lead_days == 1 we use the cheaper daily aggregate endpoint.
+
         Returns {valid_date: forecast_high_f} in Fahrenheit.
         """
         om_model = _OM_MODEL_DAILY.get(model, "gfs_seamless")
+        use_hourly = lead_days >= 2
+        if use_hourly:
+            hourly_var = f"temperature_2m_previous_day{lead_days - 1}"
+        else:
+            hourly_var = ""  # unused
+
         # Previous-runs API may limit date ranges; chunk into 90-day windows
         result: dict[date, float] = {}
         chunk_start = start
 
         while chunk_start <= end:
             chunk_end = min(chunk_start + timedelta(days=89), end)
-            params = {
+            params: dict[str, Any] = {
                 "latitude": station.lat,
                 "longitude": station.lon,
-                "daily": "temperature_2m_max",
                 "models": om_model,
                 "temperature_unit": "fahrenheit",
                 "timezone": station.timezone,
                 "start_date": chunk_start.isoformat(),
                 "end_date": chunk_end.isoformat(),
             }
+            if use_hourly:
+                params["hourly"] = hourly_var
+            else:
+                params["daily"] = "temperature_2m_max"
+
             try:
                 data = _http_get_json(_OPEN_METEO_PREVIOUS_RUNS_URL, params)
             except Exception as exc:
                 print(
                     f"[grib] Previous-runs fetch error ({om_model}, {station.city}, "
-                    f"{chunk_start}-{chunk_end}): {exc}",
+                    f"lead_days={lead_days}, {chunk_start}-{chunk_end}): {exc}",
                     file=sys.stderr,
                 )
                 chunk_start = chunk_end + timedelta(days=1)
                 continue
 
-            dates_list = data.get("daily", {}).get("time", [])
-            temps_list = data.get("daily", {}).get("temperature_2m_max", [])
-            for d_str, t in zip(dates_list, temps_list):
-                if t is None:
-                    continue
-                try:
-                    result[date.fromisoformat(d_str)] = float(t)
-                except ValueError:
-                    pass
+            if use_hourly:
+                # Parse hourly → group by local date → take max per day.
+                hourly = data.get("hourly", {})
+                times_list = hourly.get("time", [])
+                temps_list: list = []
+                for key, values in hourly.items():
+                    if key.startswith("temperature_2m") and isinstance(values, list):
+                        temps_list = values
+                        break
+                per_day_max: dict[date, float] = {}
+                for ts, t in zip(times_list, temps_list):
+                    if t is None:
+                        continue
+                    # Open-Meteo returns ISO timestamps in the requested timezone;
+                    # the date prefix is the station-local calendar day.
+                    try:
+                        d = date.fromisoformat(ts[:10])
+                    except ValueError:
+                        continue
+                    val = float(t)
+                    if d not in per_day_max or val > per_day_max[d]:
+                        per_day_max[d] = val
+                result.update(per_day_max)
+            else:
+                daily = data.get("daily", {})
+                dates_list = daily.get("time", [])
+                temps_daily: list = []
+                for key, values in daily.items():
+                    if key.startswith("temperature_2m_max") and isinstance(values, list):
+                        temps_daily = values
+                        break
+                for d_str, t in zip(dates_list, temps_daily):
+                    if t is None:
+                        continue
+                    try:
+                        result[date.fromisoformat(d_str)] = float(t)
+                    except ValueError:
+                        pass
 
             chunk_start = chunk_end + timedelta(days=1)
 
