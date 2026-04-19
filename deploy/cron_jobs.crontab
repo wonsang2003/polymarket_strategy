@@ -1,0 +1,22 @@
+# Polymarket weather alpha — paper mode cron jobs (KST)
+# Installed by: deploy/ec2_setup.sh
+# Inspect:      crontab -l
+# Edit:         crontab -e
+# Logs:         /home/ubuntu/polymarket/logs/
+
+SHELL=/bin/bash
+PATH=/home/ubuntu/polymarket/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TZ=Asia/Seoul
+
+# Full autotrade cycle every hour (settle -> analyze -> execute -> notify)
+# Phase 1 paper: hourly is conservative. Bump to */30 once calibration matures.
+0 * * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat autotrade >> /home/ubuntu/polymarket/logs/autotrade.log 2>&1
+
+# Daily calibration refresh at 04:00 KST (off-peak, after EU close)
+0 4 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat weather-calibrate >> /home/ubuntu/polymarket/logs/calibrate.log 2>&1
+
+# Daily DB backup at 04:30 KST, retain 14
+30 4 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/backup_db.py --keep 14 >> /home/ubuntu/polymarket/logs/backup.log 2>&1
+
+# Daily HTML report regeneration at 05:00 KST
+0 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat report >> /home/ubuntu/polymarket/logs/report.log 2>&1
