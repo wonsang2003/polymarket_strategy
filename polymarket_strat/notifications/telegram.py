@@ -210,6 +210,33 @@ class TelegramNotifier:
         lines.append(f"Open positions: <b>{open_count}</b>")
         lines.append(f"Session P&amp;L: {'+'if settled_pnl >= 0 else ''}${settled_pnl:,.2f}")
         lines.append(f"Cumulative P&amp;L: {'+'if cumulative_pnl >= 0 else ''}${cumulative_pnl:,.2f}")
+
+        # Surface strategy-layer telemetry so zero-signal cycles aren't a black
+        # box.  analyze() now returns a diagnostics dict with contract counts,
+        # a per-gate rejection histogram, no-forecast/no-dists contracts, and
+        # HRRR long-lead drops.  Render the top-4 rejection buckets inline so
+        # the next cycle reveals *which* gate is eating every candidate.
+        diag = cycle.get("diagnostics") or {}
+        if diag:
+            contracts = diag.get("contracts_found", 0)
+            signals = diag.get("signals_generated", 0)
+            plans = diag.get("plans_generated", 0)
+            lines.append(
+                f"Contracts: <b>{contracts}</b> | Signals: <b>{signals}</b> | "
+                f"Plans: <b>{plans}</b>"
+            )
+            gr = diag.get("gate_rejects") or {}
+            if gr:
+                top = sorted(gr.items(), key=lambda kv: -kv[1])[:4]
+                hist = ", ".join(f"{_esc(k)}={v}" for k, v in top)
+                lines.append(f"Rejections: {hist}")
+            no_fc = diag.get("no_forecast_contracts", 0)
+            no_d = diag.get("no_dists_contracts", 0)
+            if no_fc or no_d:
+                lines.append(f"No-forecast: <b>{no_fc}</b> | No-dists: <b>{no_d}</b>")
+            hrrr_drops = diag.get("hrrr_dropped_city_leads") or []
+            if hrrr_drops:
+                lines.append(f"HRRR/NAM dropped: {_esc(', '.join(hrrr_drops[:6]))}")
         return self.send_message("\n".join(lines))
 
     def send_status(self, text: str) -> dict[str, Any]:

@@ -19,16 +19,18 @@ from polymarket_strat.infrastructure.weather.persistence import WeatherDatabase
 
 class TestPnl:
     def test_yes_win(self):
-        # bought 50 shares at $1 each (entry=1.0), pays 0.98 per share on win
+        # bought $50 worth at entry=1.0 → 50 shares. Polymarket charges 2%
+        # fee on WINNINGS ONLY (profit above notional), not on entire payout.
         result = _pnl(outcome=1, notional=50.0, entry_price=1.0)
-        # n_shares=50, pnl = 50*0.98 - 50 = -1.0
-        assert result == pytest.approx(-1.0, abs=0.01)
+        # gross_profit = 50 * (1 - 1.0) = 0  →  no winnings, no fee, pnl = 0.0
+        assert result == pytest.approx(0.0, abs=0.01)
 
     def test_yes_win_cheap_entry(self):
-        # bought $50 worth at 5¢ each → 1000 shares
-        # win: 1000 * 0.98 - 50 = 930
+        # bought $50 worth at 5¢ each → 1000 shares. Fee on winnings only.
+        # gross_profit = 1000 * (1 - 0.05) = 950. fee = 0.02 * 950 = 19.
+        # pnl = 950 - 19 = 931  (equivalently: 1000 * 0.95 * 0.98 = 931)
         result = _pnl(outcome=1, notional=50.0, entry_price=0.05)
-        assert result == pytest.approx(930.0, abs=0.01)
+        assert result == pytest.approx(931.0, abs=0.01)
 
     def test_no_loss(self):
         # always lose full notional on NO
@@ -39,14 +41,20 @@ class TestPnl:
         assert _pnl(outcome=0, notional=100.0, entry_price=0.99) == -100.0
 
     def test_realistic_trade(self):
-        # $50 at 53.5¢ entry, YES wins → n_shares ≈ 93.46, pnl ≈ 93.46*0.98 - 50 ≈ 41.59
+        # $50 at 53.5¢ entry → n_shares ≈ 93.46. YES wins, fee on winnings only.
+        # gross_profit = 93.46 * (1 - 0.535) ≈ 43.46. fee ≈ 0.87. pnl ≈ 42.59
+        # (equivalently: 93.46 * 0.465 * 0.98 ≈ 42.59)
         result = _pnl(outcome=1, notional=50.0, entry_price=0.535)
-        assert result == pytest.approx(41.59, abs=0.05)
+        assert result == pytest.approx(42.59, abs=0.05)
 
     def test_zero_entry_price_no_crash(self):
-        # entry_price=0 would divide by zero; should return -notional
+        # entry_price=0 would divide by zero; guard returns n_shares=0,
+        # which under fee-on-winnings math yields pnl = 0 * anything = 0.0.
+        # Semantics: "degenerate input, no trade placed, no P&L" (not a loss).
+        # Note: min_entry_price=0.02 is enforced upstream, so this never
+        # fires in production — this test just verifies graceful handling.
         result = _pnl(outcome=1, notional=50.0, entry_price=0.0)
-        assert result == -50.0
+        assert result == 0.0
 
 
 # ---------------------------------------------------------------------------
