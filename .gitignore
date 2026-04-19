@@ -93,3 +93,15 @@ tmp/
 
 # macOS launchd plists (machine-specific)
 ~/Library/LaunchAgents/com.wonsang.*.plist
+
+# Local scratch
+_backfill_head.txt
+deploy/_*.sh
+deploy/_*.applescript
+deploy/_*.py
+deploy/upload_to_ec2.sh
+
+# Generated / data
+data/weather/
+reports/gate_sensitivity_data.json
+tools/walk_forward/last_run_*.csv
