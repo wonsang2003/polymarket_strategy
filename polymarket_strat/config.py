@@ -117,6 +117,30 @@ class TradingConstraints:
     confidence_boost: float = 1.10
     liquidity_haircut: float = 0.60
     slippage_haircut_per_spread: float = 1.50
+    # ------------------------------------------------------------------
+    # Weather-strategy tradeability knobs (Apr 19 2026 refactor).
+    #   - max_position_fraction: 5% per-position cap, floored at
+    #     min_position_notional_usd ($10) so small bankrolls can still trade.
+    #     Effective size = max(bankroll * 0.05, 10.0).
+    #     At $500 → $25, at $1k → $50, at $5k → $250. Scales forever;
+    #     consistent risk profile across bankroll sizes.
+    #   - max_correlation_group_fraction: notional cap per correlation
+    #     group (East Asia, US West, Western Europe, …). Bumped 8% → 15%
+    #     to accommodate three 5% positions in one region.
+    #   - max_daily_drawdown: locks the account for the day once today's
+    #     cumulative settled P&L falls below -(fraction * bankroll).
+    #     14% allows ~2.8 full-loss positions before braking, matching
+    #     the new 5% per-position sizing. Enforced in main.py::run_autotrade.
+    #   - min_edge_flat: forecast.py::edge() threshold. Replaces the old
+    #     tiered `0.05 + max(0, (P-0.50)*0.40)` formula with a constant
+    #     5¢ cutoff. Justified by walk-forward: market-band + flat edge
+    #     is already sufficient to dominate Sharpe + model-prob filters.
+    # ------------------------------------------------------------------
+    max_position_fraction: float = 0.05
+    min_position_notional_usd: float = 10.0
+    max_correlation_group_fraction: float = 0.15
+    max_daily_drawdown: float = 0.14
+    min_edge_flat: float = 0.05
 
 
 @dataclass(slots=True)

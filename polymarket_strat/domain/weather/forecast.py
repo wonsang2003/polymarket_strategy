@@ -149,6 +149,7 @@ class BracketProbabilityCalculator:
         model_prob: float,
         market_prob: float,
         fee_rate: float = 0.02,
+        min_edge: float = 0.05,
     ) -> tuple[float, float, bool]:
         """Compute raw edge, fee-adjusted edge, and tradeability.
 
@@ -156,15 +157,24 @@ class BracketProbabilityCalculator:
             EV = p * (1 - P) * (1 - fee) - (1 - p) * P
         Simplified: edge_after_fees ≈ raw_edge - fee * p * (1 - P)
 
-        Tradeability gates (all must pass):
-            1. Market price in [0.15, 0.75] — avoid penny artifacts and adverse payoff
-            2. Model probability ≥ 0.55 — must believe we're more likely right than wrong
-            3. Tiered edge threshold:
-               - P ≤ 0.50: edge ≥ 5¢ (standard)
-               - P > 0.50: edge ≥ 5¢ + (P - 0.50) × 0.40
-                 (at P=0.70 → 13¢, at P=0.75 → 15¢)
-            4. Minimum Sharpe per trade ≥ 0.15:
-               sharpe_per_trade = edge / sqrt(p × (1-p))
+        Tradeability gates (Apr 19 2026 refactor — see CLAUDE.md §4.3):
+            1. Market price in [0.15, 0.75] — avoid penny artifacts and
+               adverse (crushed) payoffs.
+            2. Flat min-edge ≥ 5¢ after fees — replaces the previous tiered
+               schedule `0.05 + max(0, (P-0.50) * 0.40)` which demanded up
+               to 15¢ at P=0.75. Walk-forward verified: at flat 5¢ the
+               market-band filter alone already forces a sensible floor
+               (worst p×(1-p) → 0.19, smallest edge/stdev = 0.115).
+
+        Gates explicitly REMOVED in this refactor:
+            - P_model ≥ 0.55 (killed multi-bracket spread trades where no
+              single bracket crosses 55% — see Tokyo Apr 20 example).
+            - Sharpe-per-trade ≥ 0.15 (redundant given market band + flat
+              edge: can never reject a signal that passed both).
+
+        Side-bias: currently one-sided (buy-YES only). Negative-edge
+        markets (market overpricing YES → buy-NO opportunity) are NOT
+        flagged; shorting is a separate implementation pass.
 
         Returns:
             (raw_edge, edge_after_fees, is_tradeable)
@@ -177,21 +187,8 @@ class BracketProbabilityCalculator:
         if market_prob < 0.15 or market_prob > 0.75:
             return (raw, adjusted, False)
 
-        # Gate 2: Model confidence floor
-        if model_prob < 0.55:
-            return (raw, adjusted, False)
-
-        # Gate 3: Tiered edge threshold — higher P demands larger edge
-        min_edge = 0.05
-        if market_prob > 0.50:
-            min_edge += (market_prob - 0.50) * 0.40
+        # Gate 2: Flat min-edge after fees
         if adjusted < min_edge:
-            return (raw, adjusted, False)
-
-        # Gate 4: Minimum Sharpe per trade
-        trade_vol = math.sqrt(model_prob * (1.0 - model_prob))
-        sharpe_per_trade = adjusted / trade_vol if trade_vol > 0 else 0.0
-        if sharpe_per_trade < 0.15:
             return (raw, adjusted, False)
 
         return (raw, adjusted, True)

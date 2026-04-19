@@ -138,9 +138,15 @@ def run_positions() -> None:
 
 
 def _pnl(*, outcome: int, notional: float, entry_price: float, fee: float = 0.02) -> float:
-    """Compute P&L for a binary bracket trade."""
+    """Compute P&L for a binary bracket trade.
+
+    Polymarket charges the 2% fee on WINNINGS ONLY (profit above notional),
+    not on the full payout. See `.claude/claude.md` §4.1 for the derivation.
+        WIN:  pnl = n_shares * (1 - entry_price) * (1 - fee)
+        LOSS: pnl = -notional
+    """
     n_shares = notional / entry_price if entry_price > 0 else 0
-    return round(n_shares * (1 - fee) - notional if outcome == 1 else -notional, 4)
+    return round(n_shares * (1 - entry_price) * (1 - fee) if outcome == 1 else -notional, 4)
 
 
 def _settle_from_iem(pos: dict[str, Any]) -> dict[str, Any] | None:
@@ -301,7 +307,7 @@ def run_autotrade(
     state_path: str = "runtime/portfolio_state.json",
     env_file: str = ".env",
     max_open: int = 30,
-    drawdown_brake_pct: float = 0.05,
+    drawdown_brake_pct: float | None = None,
 ) -> dict[str, Any]:
     """Full autotrade cycle: settle → safety check → analyze → execute → notify.
 
@@ -319,7 +325,12 @@ def run_autotrade(
 
     db = WeatherDatabase()
     constraints = TradingConstraints()
-    cycle: dict[str, Any] = {"mode": mode}
+    # Resolve daily-drawdown brake: CLI override → constraints default.
+    # constraints.max_daily_drawdown is 14% (Apr 19 2026), sized to
+    # accommodate ~2.8 full-loss positions under the 5% per-position cap.
+    if drawdown_brake_pct is None:
+        drawdown_brake_pct = constraints.max_daily_drawdown
+    cycle: dict[str, Any] = {"mode": mode, "drawdown_brake_pct": drawdown_brake_pct}
 
     # ------------------------------------------------------------------
     # Step 1: Settle expired trades
@@ -397,6 +408,11 @@ def run_autotrade(
     analysis = service.analyze("weather_bracket", constraints=constraints, portfolio_state=portfolio_state)
     executable = [p for p in analysis.trade_plan if p.executable]
     print(f"[autotrade]   {len(analysis.signals)} signals, {len(executable)} executable trades.", file=sys.stderr)
+    # Propagate strategy-layer telemetry so Telegram/CloudWatch can see WHY a
+    # cycle produced zero executable trades (per-gate rejection histogram,
+    # no-forecast / no-dists contract counts, HRRR long-lead drops). Without
+    # this the Lambda cycle is a black box — only the end-state is visible.
+    cycle["diagnostics"] = analysis.diagnostics or {}
 
     # ------------------------------------------------------------------
     # Step 4: Execute trades
@@ -417,8 +433,18 @@ def run_autotrade(
         else:
             executor = PaperExecutor()
 
+        # Prevent re-booking the same token_id on every cron tick.
+        # Mirrors the guard in run_execute (CLAUDE.md §10 bug fix #7).
+        already_open_token_ids: set[str] = {
+            pos["token_id"] for pos in db.get_open_positions() if pos.get("token_id")
+        }
+
         executed: list[dict[str, Any]] = []
+        skipped_duplicates = 0
         for item in executable:
+            if item.token_id and item.token_id in already_open_token_ids:
+                skipped_duplicates += 1
+                continue
             order = executor.execute_market_buy(
                 market=item.market,
                 outcome=item.outcome,
@@ -427,6 +453,9 @@ def run_autotrade(
                 reference_price=item.best_ask,
             )
             order_dict = order_to_dict(order)
+            # Mark as open so later items in the same cycle aren't re-booked
+            if item.token_id:
+                already_open_token_ids.add(item.token_id)
 
             # Persist to weather DB
             meta = item.metadata
@@ -467,6 +496,7 @@ def run_autotrade(
         portfolio_state.save(state_path)
         cycle["new_trade_count"] = len(executed)
         cycle["new_trades"] = executed
+        cycle["skipped_duplicates"] = skipped_duplicates
 
     # Cumulative P&L
     all_settled = [t for t in db.get_trades(limit=5000) if t.get("pnl") is not None]

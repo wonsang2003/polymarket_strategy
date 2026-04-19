@@ -1,6 +1,6 @@
 # POLYMARKET QUANTITATIVE TRADING SYSTEM — WORKING SPEC
 
-**Last Updated:** April 18, 2026
+**Last Updated:** April 19, 2026
 **Current Mode:** PAPER — Weather alpha under validation
 **Secondary Alpha (Musk Tweets):** spec'd in `MUSK_SPEC.md`, zero code. Do not wire into main pipeline until weather clears its 30-day gate.
 
@@ -73,14 +73,26 @@ A bracket contract is a binary on Polygon. Pays $1 if the event happens, $0 othe
 
 ### 4.1 Payout math
 
-```
-n_shares = notional / entry_price
+Polymarket charges 2% on WINNINGS ONLY (profit above notional), not on the full payout. So the correct derivation is:
 
-WIN:  pnl = n_shares * (1 - entry_price) * 0.98 - notional
+```
+n_shares    = notional / entry_price            # shares bought with notional at entry_price
+gross_profit = n_shares - notional              # = n_shares * (1 - entry_price)  (notional = n_shares * entry_price)
+fee          = 0.02 * gross_profit
+pnl_on_win   = gross_profit - fee = n_shares * (1 - entry_price) * 0.98
+
+WIN:  pnl = n_shares * (1 - entry_price) * 0.98
 LOSS: pnl = -notional
 ```
 
-**Why `min_entry_price = 0.02` is enforced**: at entry_price=0.001 a WIN on $50 gives $48,950 (50,000× leverage). These entries are always bracket-parsing artifacts or dead markets. Filter at `strategy.py:analyze()`.
+**Worked example** — $50 notional at entry_price 0.81:
+- n_shares = 50 / 0.81 = 61.73
+- gross payout on WIN = $61.73  →  gross profit = $11.73  →  fee = $0.23
+- **Net WIN P&L = $11.50** (matches `n_shares * (1 - entry_price) * 0.98 = 61.73 * 0.19 * 0.98`)
+
+**⚠ KNOWN BUG (Apr 19 2026):** `main.py:143` currently computes `n_shares * (1 - fee) - notional = n_shares * 0.98 - notional`, which applies the 2% fee to the *entire payout* rather than just winnings. This under-reports P&L by exactly `notional * 0.02` (= $1 per $50 win). The tests in `tests/test_settle.py:TestPnl` encode the same wrong formula, so fixing the bug in `main.py` requires updating those tests to the correct expected values. Live paper P&L is therefore ~$1/win more conservative than real Polymarket payout — clearing the Day 30 gate on paper means live will perform slightly better than the tape shows.
+
+**Why `min_entry_price = 0.02` is enforced**: at entry_price=0.001 a WIN on $50 gives ~$49,000 in gross profit (50,000× leverage before fee). These entries are always bracket-parsing artifacts or dead markets. Filter at `strategy.py:analyze()`.
 
 ### 4.2 Edge equation
 
@@ -89,19 +101,41 @@ raw_edge = P_model - P_market
 edge_after_fees ≈ raw_edge - 0.02 * p * (1 - P)
 ```
 
-### 4.3 Tradeability gates (all must pass, in order)
+### 4.3 Tradeability gates (Apr 19 2026 refactor — all must pass, in order)
 
-Defined in `forecast.py:BracketProbabilityCalculator.edge()`:
+Defined in `forecast.py:BracketProbabilityCalculator.edge()` + `strategy.py:analyze()`:
 
 1. Market price ∈ [0.15, 0.75] — avoid penny artifacts and crushed payoffs
-2. Model probability ≥ 0.55
-3. Tiered edge: `min_edge = 0.05 + max(0, (P - 0.50) × 0.40)` → 5¢ at P=0.50, 13¢ at P=0.70, 15¢ at P=0.75
-4. Sharpe per trade ≥ 0.15: `edge / sqrt(p × (1-p))`
-5. Quarter-Kelly × uncertainty shrinkage `1/(1 + CV²)` where `CV = prob_std / model_prob`
-6. Per-position cap 2% of bankroll
-7. Correlation group cap 8% of bankroll
-8. Daily drawdown ≤ 5%
-9. Token-id duplicate guard (don't re-enter already-open positions within the day)
+2. **Flat min-edge ≥ 5¢ after fees** — replaces the prior tiered schedule
+3. Quarter-Kelly × uncertainty shrinkage `1/(1 + CV²)` where `CV = prob_std / model_prob`
+4. **Per-position cap: `max(0.05 × bankroll, $10)`** — 5% sizing with $10 floor (was 2% fixed)
+5. **Correlation group cap: 15% of bankroll notional** (was 8%, count-based 2 positions/group)
+6. **Daily drawdown brake: 14% cumulative settled P&L** (was 5%, scaled to new per-position sizing)
+7. Token-id duplicate guard (don't re-enter already-open positions within the day)
+8. Min entry price 0.02 (50×+ implied leverage filter)
+
+**Gates EXPLICITLY REMOVED in this refactor:**
+- **`P_model ≥ 0.55` dropped.** Killed multi-bracket spread trades where no single bracket
+  crosses 55% but edge is real (Tokyo Apr 20 example: three brackets at market ~33% each,
+  model says one is 40% — valid 7¢ edge that the old gate rejected).
+- **Tiered edge schedule dropped.** Prior formula `0.05 + max(0, (P-0.50) × 0.40)` demanded
+  up to 15¢ at P=0.75. Walk-forward evidence (Apr 19, n=34,056 per lead) showed this
+  over-filters legitimate edges.
+- **Sharpe-per-trade ≥ 0.15 dropped.** Redundant at flat 5¢: the worst achievable
+  Sharpe under market-band + 5¢ floor is `0.05 / sqrt(0.75 × 0.25) = 0.115`, so any
+  threshold ≤ 0.115 is dead code. Dropping avoids false precision.
+
+**Side-bias:** currently one-sided (buy-YES only). Negative-edge markets where the
+market overprices YES (→ buy-NO opportunity) are NOT flagged. Shorting is a separate
+implementation pass — tracked as backlog.
+
+**Bankroll scaling of per-position cap:** at $500 bankroll → $25, at $1k → $50, at $5k → $250.
+Consistent risk profile across bankroll sizes, no $50 hard ceiling that capped growth
+past $1k. Floor at $10 for small bankrolls where Polymarket's order-size mechanics bite.
+
+**Daily DD interaction with per-position:** at 14% DD / 5% per-position, account tolerates
+2.8 full-loss positions before the brake locks the day. If you tighten per-position or
+loosen DD, preserve this ratio.
 
 ---
 
@@ -168,6 +202,7 @@ Pipeline in `strategy.py:calibrate()`:
 - Last **90 days** → `fetch_archived_forecasts()` → previous-runs (real forecasts)
 - Days **91–365** → `fetch_historical_highs()` → archive (reanalysis; protected by σ floor)
 - Merge: real forecasts override reanalysis where both exist.
+- **Multi-lead (Apr 19 2026)**: the loop now iterates `_CALIBRATION_LEAD_SCHEDULE = [(24, 1, True), (48, 2, False)]`. For each (lead_hours, lead_days, allow_reanalysis) tuple it calls `fetch_archived_forecasts(..., lead_days=N)` — Open-Meteo exposes N-day-lead previous runs via the `temperature_2m_max_previous_day{N-1}` daily variable. Reanalysis fill-in is 24h-only (a "48h reanalysis" is conceptually undefined — archive is observation-assimilated). `forecast_errors` rows are saved tagged with the correct `lead_hours`, so `_load_dists()` at inference hits the right bucket directly for today (24h) and tomorrow (48h) contracts. The √(lead/24) σ-scaling fallback in `_load_dists()` is now a safety net, not the primary path. 72h+ leads still fall through to σ-scaling.
 
 ### 5.5 Why HRRR/NAM are skipped in calibration
 
@@ -377,6 +412,8 @@ python scripts/backfill_regimes.py --dry-run                         # preview h
 python scripts/backfill_regimes.py --cities seoul --refit            # one city, then re-fit dists
 python scripts/backfill_regimes.py --refit                           # all cities, full year, refit
 python scripts/backfill_regimes.py --start 2025-04-01 --end 2026-04-10 --refit
+python scripts/backfill_regimes.py --lead-hours 48 --refit           # 48h-only (preserves 24h labels)
+python scripts/backfill_regimes.py --lead-hours 48 --dry-run         # preview 48h reclassification
 ```
 
 ---
@@ -412,6 +449,8 @@ python scripts/backfill_regimes.py --start 2025-04-01 --end 2026-04-10 --refit
 
 - **Phase 1 (now, 30+ days)**: Paper. Log every signal. Verify suspicious edges (>20¢) manually before they fire. Expand calibration window.
 - **Phase 2 gate (Day 30)**: Win rate ≥ 55%, cumulative P&L positive on paper, no bracket parsing artifacts. Go/No-Go.
+  - **Scope**: ALL 22 cities × both leads (24h + 48h). Do NOT pre-filter cities by walk-forward brier — let the strategy gates (`forecast.py:edge()`) and risk manager (`risk.py`) filter signals. Pre-filtering is premature optimization and cuts upside.
+  - **Post-hoc triage only**: after n ≥ 30 trades on a specific (city, lead) pair, if realized EV is negative, block that pair in `strategy.py:analyze()`. `trade_history` already logs per-trade city + lead + PnL — query it for the block decision. This is data-driven vs. pre-hoc brier cutoff.
 - **Phase 3**: $200 real capital. $10–20/position, max 2 cities. Verify paper→live price replication.
 - **Phase 4**: $50 max/bracket, 5–15 trades/day across 9+ cities. Expected steady-state: $30–100/week at $200, scaling with bankroll.
 
@@ -453,20 +492,45 @@ sqlite3                               # stdlib
 
 ## 14. Today's Known Priorities (in order)
 
-1. **Backfill historical regimes** (the #1 calibration bug). Run `python scripts/backfill_regimes.py --dry-run` first to inspect the per-city regime histogram; if distributions look sane (expect roughly 50–70% STABLE_HIGH, 10–20% TRANSITION, 5–15% FRONTAL_PASSAGE, remainder CONVECTIVE / MARINE), run `python scripts/backfill_regimes.py --refit` to apply UPDATEs and re-fit `error_distributions`. After the refit, re-run the walk-forward backtest — skill score should bump from +0.455 toward +0.48–0.50 because FRONTAL_PASSAGE days finally get a wider σ.
-2. **Re-run calibration** for the 5 stations that changed (nyc, london, shanghai, seoul, hong_kong). After re-calibration, re-run `python tools/walk_forward/backtest.py --all-cities --all-models --csv tools/walk_forward/last_run.csv` so the dashboard shows current skill scores.
-2. **Start the lag monitor** (`./scripts/start_lag_monitor.sh`) and let it collect ≥ 2 weeks of data. Then run `python tools/lag_monitor/analyze.py` to decide whether scheduled-reprice (idea 6) is worth building.
+1. **Run the 48h regime backfill (remaining calibration gap).** 24h leads already have proper regime-aware fits — April 19 breakdown showed `stable_high`, `transition`, and `frontal_passage` at 24h for both GFS and ECMWF. **Only 48h rows are still all `STABLE_HIGH`** because the new multi-lead calibration loop writes that label by default. Script extended (Apr 19 2026) — run: `python scripts/backfill_regimes.py --lead-hours 48 --refit` (preview first with `--lead-hours 48 --dry-run`). The `--lead-hours 48` flag scopes both the SELECT and UPDATE to the 48h bucket so already-correct 24h labels are preserved. After refit, re-run walk-forward at 48h to validate. Expected: 48h Brier skill ↑ from +0.421 toward ~+0.45 because FRONTAL_PASSAGE / TRANSITION days get correct σ instead of the narrow stable_high fit.
+2. **Start the lag monitor** and let it collect ≥ **4 days** of data (not 2 weeks). Use `caffeinate -i` on Mac so laptop-sleep doesn't kill the run: `caffeinate -i ./scripts/start_lag_monitor.sh &`. Then run `python tools/lag_monitor/analyze.py` to decide whether scheduled-reprice (idea 6) is worth building. Rationale for 4 days: at ~30 price_change events/hour × 96h = ~2,880 samples, percentile estimates are ±8% CI — sharp enough for a "30 min vs 2 hr" repricing-cadence decision. If result is borderline (e.g., median lag ~45 min), extend the run rather than guess.
 3. **Install Tailscale + dashboard agent** on the Mac that runs the pipeline. One-shot: `./deploy/install_dashboard_agent.sh`. Phone-accessible monitoring is required discipline through Phase 2 — if you can't see the account from anywhere, you won't catch a live issue.
 4. **Verify** the 2 suspiciously-large-edge signals (London 17–18°C +45.9¢, Toronto sub-16°C +57.9¢) are bracket-parsing artifacts before letting them fire even in paper.
 5. **Log every paper signal** through Day 30 gate. Do not deploy real capital before the gate.
 6. **Wire `fit_bayesian()` into live `calibrate()`** only after Phase 2 clears. The function is implemented (`calibration.py:fit_bayesian` + `summarize_posterior`) but live calibration still uses MLE. Toggle only when paper P&L earns the right to a more complex pipeline.
-7. Musk alpha stays frozen until weather clears Phase 2.
+7. **Shrink 24h reliability gap (under-confidence in [0.4, 0.7) bins).** April 19 walk-forward showed systematic −10% gap in mid-confidence bins — model predicts 65%, reality is 77%. 48h is already well-calibrated (gap < 8%); this is a 24h-specific issue. Ranked fixes:
+   - **7a. σ floor relaxation** (highest-leverage structural fix). `_SIGMA_FLOOR_F = 2.5` in `forecast.py` was originally protection against reanalysis-tight σ. Now that 91 days of real-forecast previous-runs data exists per (city, model, 24h), drop the floor to 2.0°F when `n_real ≥ 60`, or remove entirely for those buckets. Expected gap shrinkage 30-50%.
+   - **7b. Real-forecast sample weighting in MLE.** `fit_error_distribution()` currently weights all samples equally. In the 365-day window, 91 real-forecast days are drowned by 275 reanalysis days (artificially tight σ inflates the reanalysis contribution, pulling the fit toward a narrower distribution than truth). Fix: pass `sample_weight = 1.0 for real, 0.3 for reanalysis` into `scipy.optimize.minimize` MLE. Expected gap shrinkage 20-40%.
+   - **7c. Post-hoc isotonic calibration.** Fit `sklearn.isotonic.IsotonicRegression` on last walk-forward CSV (`mean_pred → hit_rate`), save as per-(city, lead) lookup, apply in `bracket_probability()` as the last step before returning P. Dataset-free to re-fit nightly. Textbook answer. Expected gap shrinkage 60-80%.
+   - **7d. Temperature scaling.** Single-param sharpening `P' = P^τ / (P^τ + (1-P)^τ)`, fit τ to minimize log-loss on walk-forward CSV. Under-confidence → τ > 1 will sharpen mid-range predictions. Interpretable. Expected gap shrinkage 70-90% in [0.4, 0.7) specifically.
+   - **Recommended sequence**: 7a first (structural, compounds with everything else), then 7c or 7d (post-hoc safety net). Don't do 7b and 7a simultaneously — verify each independently via walk-forward rerun so you know which lever moved the gap.
+8. Musk alpha stays frozen until weather clears Phase 2.
 
 ### Completed since last spec update
 - WAL mode + rotated SQLite backups (`scripts/backup_db.py`).
 - Lag monitor (`tools/lag_monitor/`) — ready to deploy; waiting on 2 weeks of data.
 - `fit_bayesian()` + `summarize_posterior()` implemented with PyMC.
-- Walk-forward backtest (`tools/walk_forward/backtest.py`). Last full run: overall Brier skill score +0.455 across 22 cities × 2 models × 100 days.
+- Walk-forward backtest (`tools/walk_forward/backtest.py`). Last full run: overall Brier skill score +0.455 across 22 cities × 2 models × 100 days. `--lead-hours` flag already present — run with `--lead-hours 48` after the recalibration below to validate tomorrow-contract skill.
 - Read-only Streamlit dashboard + Tailscale + launchd auto-start.
+- **Payout formula fix (Apr 19 2026)**: `main.py::_pnl` now computes `n_shares * (1 - entry_price) * (1 - fee)` — 2% fee on winnings only, matching Polymarket's actual payout. `tests/test_settle.py` asserts updated accordingly. See §4.1.
+- **Forecast horizon fix (Apr 19 2026)**: `strategy.py::_analyze_weather_brackets` now computes `lead_hours` per contract from `(target_date - today).days` and threads it into `fetch_all_models(..., lead_hours=lead_hours)`. Forecast cache re-keyed on `(city, lead_hours)` so today-24h and tomorrow-48h contracts each get the correct-horizon forecast. `_load_dists` has a √(lead/24) σ-scaling safety net for leads missing from calibration data.
+- **Local-time lead + 48h hard cap (Apr 19 2026 late)**: `strategy.py::analyze` now derives `lead_hours` from station-local wall-clock time against a 17:00-station-local lock-in point instead of a UTC date-diff. Three failure modes of the UTC formula are eliminated: (a) Asian-station timezone off-by-one where 09:00 local / 00:00 UTC read as "yesterday", (b) same-contract lead_hours at 06:00 vs 20:00 local despite >14h of real horizon difference, (c) the documented `+ 1` bump that routed D+2 contracts into the 72h bucket. Root cause of the Apr 19 2026 Mexico City 27°C+ false positive (model_prob 72.66% vs market 20%, 51.5¢ edge): D+2 contract hit the 72h bucket, σ-scaling fallback scaled the 24h frontal_passage dist by √3, σ floor clamped to 2.5°F, and the 72h forecast itself ran hotter (GFS 81.6°F vs 78.0°F at 48h; ECMWF 83.7°F vs 81.4°F) — compounding into the inflated probability. New formula: `settlement_local = datetime.combine(target_date, time(17,0), tzinfo=ZoneInfo(station.timezone)); raw_lead_h = (settlement_local - datetime.now(tz)).total_seconds()/3600`. Four new `gate_rejects` counters propagate into `StrategyAnalysis.diagnostics`: `missing_timezone`, `past_settlement` (raw_lead ≤ 0), `too_close_to_settlement` (< 6h — observation likely captured or noise dominates), `beyond_calibration_horizon` (> 48h — hard cap, see below). Module constant `_LOCK_IN_LOCAL = time(hour=17)` is a defensible temperate-latitude default; tropical stations (Dubai, Singapore, Hong Kong summer) max earlier so 17:00 over-buffers, with cost limited to a few extra `too_close_to_settlement` skips near the boundary. Imports added: `time` from `datetime`, `ZoneInfo` from `zoneinfo`.
+- **48h hard cap on tradeable horizon (Apr 19 2026 late)**: `strategy.py::analyze` now refuses to process any contract with `raw_lead_h > 48.0`, bumping `gate_rejects["beyond_calibration_horizon"]` instead. Rationale: `_CALIBRATION_LEAD_SCHEDULE = [(24, 1, True), (48, 2, False)]` only fits 24h and 48h buckets from real-forecast previous-runs data. Beyond 48h, `_load_dists` falls through to the `ErrorDistribution(sigma=base.sigma * √(bucket/24))` scaling approximation, which assumes random-walk error growth but in practice pairs a too-narrow σ with a potentially-hot long-lead forecast (the Mexico City pathology). Better to skip than to trade on a distribution we didn't calibrate. When/if calibration coverage is extended to 72h, relax this cap and the σ-scaling path reverts to a true safety net. The `_bucket_lead` list `[6, 12, 24, 48, 72]` remains unchanged since intermediate buckets (6, 12, 36) can still be hit by today/tomorrow contracts at specific times of day — those fall through to √(lead/24) scaling from 24h, which is far less inflationary than √3 scaling at 72h.
+- **Multi-lead calibration (Apr 19 2026)**: calibration loop in `strategy.py::calibrate()` iterates `_CALIBRATION_LEAD_SCHEDULE = [(24, 1, True), (48, 2, False)]`, fetching both 24h and 48h previous-runs forecasts from Open-Meteo and saving `forecast_errors` with correct `lead_hours`. `fetch_archived_forecasts` in `grib_client.py` now accepts `lead_days` and uses Open-Meteo's `temperature_2m_max_previous_day{N}` variable-suffix convention. YOU VERIFY on first run: confirm Open-Meteo response keys for `previous_day2` — some endpoints echo the suffix, some collapse it. Response parsing accepts any key prefixed with `temperature_2m_max`.
+- **Market cutoff fix (Apr 19 2026, revised)**: `market_scanner.py` uses Polymarket's authoritative `endDateIso`/`closed`/`acceptingOrders` fields as the primary trade-cutoff check. The fixed 16:00-station-local heuristic remains as a fallback only when those fields are missing. Also drops stale resolution-date contracts (>1 day in the past) defensively. **Refined Apr 19 late**: `endDate` (note: no `Iso` suffix) is date-only (e.g. `"2026-04-19"`) and parses as midnight UTC, which caused the scanner to treat every same-day-resolution market as "already closed" for the first 16+ hours of UTC — silently dropping the entire Asia/Europe trading window of 24h-lead contracts. Fix: only accept `endDateIso`/`end_date_iso`, and additionally require a `"T"` in the string (so any future date-only field can't regress this). Fallback to the 16:00 station-local heuristic when no ISO timestamp is present. This was the root cause of the "0 signals every hour" EC2 cron behavior for the 24h-lead bucket.
+- **48h hourly-based fetch landed (Apr 19 2026)**: `grib_client.py::fetch_archived_forecasts` for `lead_days >= 2` now uses the hourly endpoint with `temperature_2m_previous_day{N-1}` and groups by station-local date to recover daily max. Open-Meteo's `_previous_day{N}` suffix only exists on hourly variables, not on daily aggregates. First live run (Apr 19): 91 real-forecast days / (city, model) at 48h lead, 44 distributions fit at 48h. `scripts/verify_48h_fetch.py` is a 5-second smoke test for future regressions.
+- **Walk-forward verified at both leads (Apr 19 2026)**: 22 cities × 2 models, window 2026-01-15 → 2026-04-10, n = 34,056 predictions per lead. **24h Brier skill +0.479**, **48h Brier skill +0.421**. Skill drop only 12% at 48h lead — tomorrow contracts are tradeable. Reliability analysis: 24h is systematically **under-confident** in [0.4, 0.7) bins (−10% gap), 48h is well-calibrated (gap < 8%). CSVs at `tools/walk_forward/last_run_24h.csv` and `last_run_48h.csv`. See §14 priority 7 for gap-shrinkage options.
+- **Phase 2 scope confirmed (Apr 19 2026)**: paper trading at ALL 22 cities × both leads. Per-city × lead realized P&L logged in `trade_history`. Post-hoc block if (city, lead) EV < 0 after n ≥ 30 trades. No pre-hoc pruning — upstream gates handle the filtering.
+- **Tradeability gate + risk-param refactor (Apr 19 2026 late)**: simplified `forecast.py::edge()` from four gates to two (market-band + flat 5¢ min-edge), and re-parameterized position sizing / correlation-group / daily-DD to scale with bankroll. Motivation: the prior config was a "$200 tuning" — fixed $50 per-position cap capped compounding past $1k, 2% per-position was quarter-Kelly-implied but ignored the $10 Polymarket floor at small bankrolls, and the tiered edge + Sharpe gates over-filtered multi-bracket spread markets where no single bracket crossed the 0.55 model-prob floor (Tokyo Apr 20 was the motivating case). Changes wired:
+  - `config.py`: added `max_position_fraction=0.05`, `min_position_notional_usd=10.0`, `max_correlation_group_fraction=0.15`, `max_daily_drawdown=0.14`, `min_edge_flat=0.05` to `TradingConstraints`. All old fields preserved for backward compat.
+  - `forecast.py::edge()`: removed `model_prob ≥ 0.55` gate, removed tiered-edge formula, removed Sharpe-per-trade ≥ 0.15 gate. Signature now `edge(*, model_prob, market_prob, fee_rate=0.02, min_edge=0.05)` — explicit `min_edge` parameter (defaults to 5¢) so callers can override per-cycle. Worst-case Sharpe under the remaining market-band + flat-edge filter is `0.05 / sqrt(0.75×0.25) = 0.115`, making any Sharpe gate ≤ 0.115 dead code — dropping it rather than keeping vestigial logic.
+  - `strategy.py::analyze()`: gate_rejects histogram reduced from `gate1_market_band / gate2_model_conf / gate3_min_edge / gate4_sharpe / strategy_min_edge` to `gate1_market_band / gate2_min_edge`. Correlation-group enforcement switched from count-based (`max_positions_per_group=2`) to notional-based (`constraints.bankroll × 0.15`) — a new trade is rejected if `group_notional[group] + target_notional > group_notional_cap`. Per-position sizing is now `min(kelly × bankroll, max(bankroll × 0.05, $10))` — the floor prevents the cap from degenerating below $10 on small bankrolls (at $200 bankroll, 5% = $10 exactly, so the floor only bites below $200). Diagnostics output renamed `correlation_group_counts` → `correlation_group_notional`, with new `per_position_cap` + `group_notional_cap` fields for dashboard visibility.
+  - `main.py::run_autotrade`: `drawdown_brake_pct` default changed from hardcoded `0.05` to `None`, resolved at call-time from `constraints.max_daily_drawdown` (14%). Daily-DD brake now tolerates 2.8 full-loss positions before locking, preserving the ratio with the new per-position sizing. Explicit override via function kwarg still works for backtests / CLI experimentation.
+  - **Side-bias unchanged**: still one-sided (buy-YES only). Negative-edge markets (market overpricing YES → buy-NO) are NOT flagged. Shorting remains a separate implementation pass — tracked in backlog.
+  - Tests (`tests/test_settle.py` + `test_strategy.py`) do not exercise the dropped gates, so 24 passing tests remain green. Worth adding a future `test_forecast_edge.py` to pin the new 2-gate contract against regressions.
+  - Expected signal volume: should rise 2-4× per cycle. Tokyo-style spread markets (no bracket ≥ 0.55) now pass, and `0.15 ≤ P_market ≤ 0.75` × flat-5¢ is a much wider acceptance set than `0.55 ≤ P_model` × tiered-up-to-15¢. Phase 2 post-hoc (city, lead) EV block remains the backstop if bad trades leak through.
+- **HRRR/NAM long-lead inference gate (Apr 19 2026)**: `strategy.py::_analyze_weather_brackets` now drops HRRR/NAM forecasts when `lead_hours > 36` before regime classification + `_load_dists`. First live e2e_verify run showed HRRR at 48h returning values 14-28°F colder than GFS/ECMWF agreement for NYC/Chicago/Toronto/Atlanta (contaminating the 0.10-weighted ensemble). HRRR's designed horizon is ~18h (extended ~36h); NAM similar. Beyond that Open-Meteo serves degraded/sentinel output with no marginal information vs GFS+ECMWF. `scripts/e2e_verify.py` mirrors the same gate for diagnostic consistency. Stderr logs each drop with city + model + observed value for visibility.
+- **backfill_regimes.py `--lead-hours` flag (Apr 19 2026)**: script now accepts `--lead-hours {6,12,24,48,72}` to scope the `SELECT` + `UPDATE` to a single lead bucket. Required for the remaining 48h STABLE_HIGH gap: running the full backfill unscoped would overwrite already-correct 24h frontal_passage/transition labels with the re-classified value. Run `python scripts/backfill_regimes.py --lead-hours 48 --refit` to close the gap without collateral damage.
+- **Event-based market discovery (Apr 19 2026 late)**: `market_scanner.py::find_weather_bracket_markets` pivoted from flat-`/markets` scanning to event-first discovery. Root cause diagnosed from live Tokyo data: Polymarket bundles all brackets for a resolution day into one event (e.g. `highest-temperature-in-tokyo-on-april-20-2026` → 11 child markets from 15°C through 26°C-or-higher). The flat `/markets?order=volume24hr` feed only surfaces high-volume child markets; low-volume middle brackets (21°C, 22°C for Tokyo Apr 20) fell past offset=3000 and were silently dropped. New flow: (1) paginate `/events?active=true&closed=false` up to `max_events=5000`, (2) filter events whose title/slug contains a weather keyword, (3) walk each event's embedded `markets` array (or fall back to `/events/{id}` hydration if list response omits children), (4) union with flat `/markets` scan as legacy safety net (handles events without standard slug pattern), (5) dedupe by `conditionId`/`id`, then run existing per-market filters (closed/acceptingOrders/endDateIso/question-regex/bracket-parse). `PolymarketPublicClient` gained `get_events()` + `get_event()`. Scanner stderr now logs: `events scanned=N matched=M / flat=K / union=U`. Expected coverage jump: today's 66 contracts should climb closer to 100+ once every event's full bracket set is enumerated. See Tokyo Apr 19 diagnostic — event 387435 had 11 children, flat scan captured only the 4 open tail brackets by rank.
 
 Cross-referenced files: `MUSK_SPEC.md` for tweet alpha design, `reports/profitability_analysis.html` for MC equity-curve math, `reports/weather_alpha_workflow.html` for end-to-end pipeline diagram, `tools/dashboard/README.md` for remote-monitoring setup.

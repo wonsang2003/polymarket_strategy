@@ -10,15 +10,30 @@ Implements the Strategy Protocol (analyze + backtest) by wiring together:
 """
 from __future__ import annotations
 
+import math
 import statistics
 import sys
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
 from pathlib import Path
 from typing import Any
+
+# Effective settlement moment (station-local) for forecast-horizon computation.
+# Polymarket settles at end-of-day in the station's timezone, but the daily
+# temperature max is typically locked in by ~17:00 local (heat-of-the-day +
+# station thermal lag). Using 17:00 as the "lead zero" point means:
+#   - D+0 contract called at 09:00 local → ~8h lead (short-range, trade)
+#   - D+0 contract called at 20:00 local → past lock-in, skip (observed)
+#   - D+1 contract called at 23:00 local → ~18h lead → 24h bucket
+#   - D+2 contract any time → lead > 48h → skip (no calibration coverage)
+# Temperate-latitude defensible default; tropical stations (Dubai, Singapore,
+# Hong Kong summer) max slightly earlier — 17:00 over-buffers but cost is
+# only a few extra "too_close_to_settlement" skips near the boundary.
+_LOCK_IN_LOCAL = time(hour=17)
 
 from polymarket_strat.config import PortfolioState, TradingConstraints
 from polymarket_strat.domain.models import (
@@ -99,26 +114,129 @@ class WeatherBracketStrategy:
         signals: list[StrategySignal] = []
         plans: list[TradePlan] = []
         risk_mgr = PortfolioRiskManager(constraints, portfolio_state)
-        group_counts: dict[str, int] = defaultdict(int)
-        # Cache forecasts per city so we don't re-fetch for each date
-        forecast_cache: dict[str, Any] = {}
+        # Correlation-group cap is now notional-based (CLAUDE.md §4.3).
+        # Tracks cumulative $-exposure per correlation group within this
+        # analyze() cycle; each new plan must leave room under
+        # `constraints.bankroll * constraints.max_correlation_group_fraction`
+        # (default 15%). Replaces the prior count-based cap of 2 positions.
+        group_notional: dict[str, float] = defaultdict(float)
+        # Precompute once — these do not change within a cycle.
+        per_position_cap = max(
+            constraints.bankroll * constraints.max_position_fraction,
+            constraints.min_position_notional_usd,
+        )
+        group_notional_cap = (
+            constraints.bankroll * constraints.max_correlation_group_fraction
+        )
+        # Cache forecasts per (city, lead_bucket) so tomorrow's 48h contracts and
+        # today's 24h contracts each get the correct-horizon forecast.
+        forecast_cache: dict[tuple[str, int], Any] = {}
+
+        # Gate rejection histogram — propagates into StrategyAnalysis.diagnostics
+        # so run_autotrade can surface exact failure mode (which gate ate each
+        # candidate contract) in CloudWatch + Telegram. Without this every
+        # "no_executable_signals" cycle is an opaque black box.
+        gate_rejects: dict[str, int] = defaultdict(int)
+        no_forecast_contracts = 0
+        no_dists_contracts = 0
+        hrrr_dropped_city_leads: set[tuple[str, int]] = set()
 
         for (city, target_date), date_contracts in by_city_date.items():
             station = CITY_REGISTRY.get(city)
             if not station:
                 continue
 
-            # Fetch latest model forecasts (cached per city within one analyze run)
-            if city not in forecast_cache:
-                fetched = self.grib.fetch_all_models(station)
-                if not fetched:
-                    print(f"[weather] No forecasts available for {city}, skipping.", file=sys.stderr)
-                    forecast_cache[city] = []
-                else:
-                    forecast_cache[city] = fetched
-            forecasts = forecast_cache[city]
-            if not forecasts:
+            # Compute lead_hours in station-local wall-clock time, not a UTC
+            # date-diff. The prior UTC-date-diff formula had two compounding
+            # bugs:
+            #   (a) Asian stations at 09:00 local = 00:00 UTC were read as
+            #       "yesterday" and silently bumped +1 day.
+            #   (b) A D+0 contract at 06:00 local (10+h of real forecast
+            #       horizon) and the same contract at 20:00 local (daily max
+            #       already observed) received identical lead_hours.
+            # Plus an off-by-one `+ 1` that shifted every contract one bucket
+            # beyond its true horizon, routing D+2 to the 72h bucket that has
+            # no calibration data. Observed fallout: Apr 19 2026 Mexico City
+            # 27°C+ contract for Apr 21 priced at 72.7% model vs 20% market
+            # because the 72h bucket hit the √(lead/24) σ-scaling fallback
+            # against a hotter 72h forecast.
+            try:
+                tz = ZoneInfo(station.timezone)
+            except Exception:
+                gate_rejects["missing_timezone"] += len(date_contracts)
                 continue
+            now_local = datetime.now(tz)
+            settlement_local = datetime.combine(
+                target_date, _LOCK_IN_LOCAL, tzinfo=tz
+            )
+            raw_lead_h = (settlement_local - now_local).total_seconds() / 3600.0
+
+            # Past-settlement: observation already captured. No model edge
+            # possible; any price movement is late-info / noise trading.
+            if raw_lead_h <= 0:
+                gate_rejects["past_settlement"] += len(date_contracts)
+                continue
+            # Sub-6h: either the daily max has likely already occurred so the
+            # market knows the answer, or station-vs-forecast bias noise
+            # dominates the bracket width. Not tradeable by this strategy.
+            if raw_lead_h < 6.0:
+                gate_rejects["too_close_to_settlement"] += len(date_contracts)
+                continue
+            # Hard cap at 48h — calibration coverage only exists at the 24h
+            # and 48h buckets (see _CALIBRATION_LEAD_SCHEDULE). Without real
+            # previous-runs data at 72h+, the σ-scaling fallback scales a
+            # narrow 24h frontal_passage dist by √3 and — combined with the
+            # σ floor of 2.5°F and hotter long-lead forecasts — produces
+            # inflated model probabilities on wide brackets. Refuse to trade
+            # beyond the horizon we have real data for.
+            if raw_lead_h > 48.0:
+                gate_rejects["beyond_calibration_horizon"] += len(date_contracts)
+                continue
+
+            lead_hours = _bucket_lead(raw_lead_h)
+
+            cache_key = (city, lead_hours)
+            # Fetch latest model forecasts at the correct horizon for this contract.
+            if cache_key not in forecast_cache:
+                fetched = self.grib.fetch_all_models(station, lead_hours=lead_hours)
+                if not fetched:
+                    print(
+                        f"[weather] No forecasts available for {city} @ {lead_hours}h lead, skipping.",
+                        file=sys.stderr,
+                    )
+                    forecast_cache[cache_key] = []
+                else:
+                    forecast_cache[cache_key] = fetched
+            forecasts = forecast_cache[cache_key]
+            if not forecasts:
+                no_forecast_contracts += len(date_contracts)
+                continue
+
+            # HRRR/NAM inference gate: these short-range models are designed for
+            # lead horizons up to ~18h (HRRR) / ~36h (NAM). Beyond that Open-Meteo
+            # returns degraded or sentinel values (observed Apr 19 2026:
+            # NYC/Chicago/Toronto/Atlanta HRRR at 48h lead were 14-28°F too cold
+            # vs GFS/ECMWF agreement, contaminating the 0.10-weighted ensemble
+            # vote and crushing p_model for borderline brackets). GFS+ECMWF carry
+            # the signal past 36h; at weight-0.10 the short-range models provide
+            # no marginal information at those leads anyway.
+            if lead_hours > 36:
+                kept: list[Any] = []
+                for fc in forecasts:
+                    if fc.model in {WeatherModel.HRRR, WeatherModel.NAM}:
+                        hrrr_dropped_city_leads.add((city, lead_hours))
+                        print(
+                            f"[weather] Dropping {fc.model.value} for {city} at "
+                            f"{lead_hours}h lead (beyond short-range horizon, "
+                            f"value={fc.forecast_high_f:.1f}°F).",
+                            file=sys.stderr,
+                        )
+                        continue
+                    kept.append(fc)
+                forecasts = kept
+                if not forecasts:
+                    no_forecast_contracts += len(date_contracts)
+                    continue
 
             # Classify regime — prefer ensemble-based (82 members) over heuristic
             try:
@@ -146,14 +264,42 @@ class WeatherBracketStrategy:
             def _load_dists(r: SynopticRegime) -> tuple[list[ErrorDistribution], list[Any]]:
                 dists, fcs = [], []
                 for fc in forecasts:
-                    dist = self.db.get_error_distribution(city, fc.model, r, _bucket_lead(fc.lead_hours))
+                    fc_bucket = _bucket_lead(fc.lead_hours)
+                    dist = self.db.get_error_distribution(city, fc.model, r, fc_bucket)
                     # HRRR/NAM share gfs_seamless in the archive so we calibrate only GFS.
                     # At inference we use live HRRR/NAM forecasts (real independent signal)
                     # but borrow the GFS error distribution as the uncertainty estimate.
                     if dist is None and fc.model in {WeatherModel.HRRR, WeatherModel.NAM}:
                         dist = self.db.get_error_distribution(
-                            city, WeatherModel.GFS, r, _bucket_lead(fc.lead_hours)
+                            city, WeatherModel.GFS, r, fc_bucket
                         )
+                    # Lead-hours safety net: calibration now fetches 24h + 48h
+                    # previous-runs forecasts and stores per-lead forecast_errors,
+                    # so the direct lookup above should hit for today (24h) and
+                    # tomorrow (48h) contracts. This √(lead/24) σ-scaling fallback
+                    # only fires if (a) calibration hasn't been re-run since the
+                    # multi-lead fix, (b) the 48h previous-runs fetch failed for
+                    # this city/model, or (c) a 72h+ contract is in scope (not yet
+                    # on the calibration schedule). Random-walk growth approximation
+                    # is the standard ansatz for well-calibrated NWP error.
+                    if dist is None and fc_bucket != 24:
+                        base = self.db.get_error_distribution(city, fc.model, r, 24)
+                        if base is None and fc.model in {WeatherModel.HRRR, WeatherModel.NAM}:
+                            base = self.db.get_error_distribution(city, WeatherModel.GFS, r, 24)
+                        if base is not None:
+                            scale = (fc_bucket / 24.0) ** 0.5
+                            dist = ErrorDistribution(
+                                city=base.city,
+                                model=base.model,
+                                regime=base.regime,
+                                lead_hours=fc_bucket,
+                                family=base.family,
+                                mu=base.mu,
+                                sigma=base.sigma * scale,
+                                shape=base.shape,
+                                nu=base.nu,
+                                n_samples=base.n_samples,
+                            )
                     if dist is None:
                         continue
                     # Skip outlier distributions: large bias (|μ|>5°F) or extreme spread
@@ -176,6 +322,7 @@ class WeatherBracketStrategy:
                 error_dists, matching_forecasts = _load_dists(SynopticRegime.STABLE_HIGH)
 
             if not error_dists:
+                no_dists_contracts += len(date_contracts)
                 print(
                     f"[weather] No calibrated distributions for {city} (tried {regime.value} + stable_high). "
                     f"Run: polymarket-strat weather-calibrate --cities {city}",
@@ -198,13 +345,37 @@ class WeatherBracketStrategy:
 
             # Emit signals and plans for tradeable edges
             group_key = station.correlation_group.value
+            # Effective min_edge for this cycle: the strategy-level threshold
+            # (self.min_edge) and the constraints-level threshold
+            # (constraints.min_edge_flat) should normally agree at 5¢, but
+            # we take the tighter of the two so either knob can raise the bar.
+            effective_min_edge = max(self.min_edge, constraints.min_edge_flat)
             for bp, contract in zip(priced, date_contracts):
-                if bp.edge_after_fees < self.min_edge:
-                    continue
-                if group_counts[group_key] >= self.max_positions_per_group:
+                # CLAUDE.md §4.3 gate check (Apr 19 2026 refactor — down from
+                # four gates to two). self.calc.edge() now enforces exactly:
+                #   gate1: market_prob ∈ [0.15, 0.75]
+                #   gate2: edge_after_fees ≥ min_edge (flat 5¢)
+                # The prior model_prob ≥ 0.55 and Sharpe ≥ 0.15 gates were
+                # dropped: the former killed legitimate multi-bracket spread
+                # trades (e.g. Tokyo Apr 20 where no single bracket crossed
+                # 55%); the latter is redundant given market-band × flat-edge.
+                _, _, is_tradeable = self.calc.edge(
+                    model_prob=bp.model_prob,
+                    market_prob=bp.market_prob,
+                    fee_rate=self.fee_rate,
+                    min_edge=effective_min_edge,
+                )
+                if not is_tradeable:
+                    # Attribute reject to first-failing gate. Gate order must
+                    # mirror BracketProbabilityCalculator.edge() in forecast.py.
+                    if bp.market_prob < 0.15 or bp.market_prob > 0.75:
+                        gate_rejects["gate1_market_band"] += 1
+                    else:
+                        gate_rejects["gate2_min_edge"] += 1
                     continue
                 # Skip near-zero prices: unrealistic fills and 50x+ implied leverage
                 if contract.market_price_yes < constraints.min_entry_price:
+                    gate_rejects["min_entry_price"] += 1
                     continue
 
                 signal = StrategySignal(
@@ -231,12 +402,31 @@ class WeatherBracketStrategy:
                 )
                 signals.append(signal)
 
+                # Position sizing: quarter-Kelly × CV² shrinkage (already baked
+                # into bp.kelly_fraction) capped at
+                #   max(bankroll * max_position_fraction, min_position_notional).
+                # At $500 bankroll → $25 cap, at $1k → $50, at $5k → $250.
+                # The floor prevents the cap from degenerating to <$10 on very
+                # small bankrolls (where Polymarket's order-size mechanics bite).
                 target_notional = min(
                     bp.kelly_fraction * constraints.bankroll,
-                    constraints.max_single_trade_notional,
+                    per_position_cap,
                 )
                 if target_notional < constraints.min_order_size:
+                    gate_rejects["min_order_size"] += 1
                     continue
+
+                # Correlation-group notional cap: reject if this new trade
+                # would push group $-exposure past 15% of bankroll. Tracked
+                # per-cycle; persistent cross-cycle group exposure is handled
+                # by the generic PortfolioRiskManager at fill-time.
+                if group_notional[group_key] + target_notional > group_notional_cap:
+                    gate_rejects["group_cap"] += 1
+                    continue
+
+                plan_executable = contract.spread <= constraints.max_spread
+                if not plan_executable:
+                    gate_rejects["spread_too_wide"] += 1
 
                 plans.append(TradePlan(
                     strategy_name=self.name,
@@ -256,7 +446,7 @@ class WeatherBracketStrategy:
                     top_bid_size=0.0,
                     risk_score=1.0 - bp.uncertainty_shrinkage,
                     expected_value=bp.edge_after_fees,
-                    executable=contract.spread <= constraints.max_spread,
+                    executable=plan_executable,
                     rationale=[
                         f"Model prob {bp.model_prob:.1%} vs market {bp.market_prob:.1%}",
                         f"Edge after fees: {bp.edge_after_fees:.1%}",
@@ -264,7 +454,7 @@ class WeatherBracketStrategy:
                     ],
                     metadata=signal.metadata,
                 ))
-                group_counts[group_key] += 1
+                group_notional[group_key] += target_notional
 
         plans.sort(key=lambda p: (-p.expected_value, p.risk_score))
         return StrategyAnalysis(
@@ -276,7 +466,18 @@ class WeatherBracketStrategy:
                 "contracts_found": len(contracts),
                 "signals_generated": len(signals),
                 "plans_generated": len(plans),
-                "correlation_group_counts": dict(group_counts),
+                "executable_count": sum(1 for p in plans if p.executable),
+                "correlation_group_notional": {
+                    k: round(v, 2) for k, v in group_notional.items()
+                },
+                "per_position_cap": round(per_position_cap, 2),
+                "group_notional_cap": round(group_notional_cap, 2),
+                "gate_rejects": dict(gate_rejects),
+                "no_forecast_contracts": no_forecast_contracts,
+                "no_dists_contracts": no_dists_contracts,
+                "hrrr_dropped_city_leads": [
+                    f"{c}@{l}h" for c, l in sorted(hrrr_dropped_city_leads)
+                ],
             },
         )
 
@@ -416,66 +617,84 @@ class WeatherBracketStrategy:
             )
 
             city_fitted = 0
+            # Calibration leads: 24h (today contracts) + 48h (tomorrow contracts).
+            # Each lead needs its own previous-runs fetch because the model's
+            # error distribution grows with lead time (σ_48h ≈ √2 × σ_24h for
+            # well-calibrated NWP). Reanalysis fallback is 24h-only because
+            # archive is observation-assimilated — a "48h reanalysis" is
+            # conceptually undefined.
+            _CALIBRATION_LEAD_SCHEDULE = [
+                (24, 1, True),   # (lead_hours, lead_days, allow_reanalysis_fallback)
+                (48, 2, False),
+            ]
             for model in WeatherModel:
                 if model not in _ARCHIVE_CALIBRATION_MODELS:
                     continue
 
-                # Prefer the previous-runs API (true operational forecasts,
-                # ~90-day rolling archive) over the reanalysis archive.
-                # The archive API (gfs_seamless / ecmwf_ifs025) has already
-                # assimilated observations → σ is 2-4x too tight (0.9°F vs
-                # the real 2.5-4°F from NWS verification).  The previous-runs
-                # API stores what the model actually predicted before the event.
-                prev_runs_start = max(start, end - timedelta(days=90))
-                print(
-                    f"[calibrate]   {city_key}/{model.value}: "
-                    f"fetching real forecasts {prev_runs_start}→{end} (previous-runs API)...",
-                    file=sys.stderr,
-                )
-                archive_prev = self.grib.fetch_archived_forecasts(
-                    station, model, start=prev_runs_start, end=end
-                )
-
-                # Fill older dates from reanalysis archive (only source available
-                # beyond ~90 days).  σ floor in BracketProbabilityCalculator
-                # (2.5°F) prevents overconfidence from these samples.
-                archive_hist: dict[date, float] = {}
-                if start < prev_runs_start:
+                for lead_hours, lead_days, allow_reanalysis in _CALIBRATION_LEAD_SCHEDULE:
+                    # Prefer the previous-runs API (true operational forecasts,
+                    # ~90-day rolling archive). For 48h lead, the previous-runs
+                    # API exposes `temperature_2m_max_previous_day2` etc.
+                    prev_runs_start = max(start, end - timedelta(days=90))
                     print(
-                        f"[calibrate]   {city_key}/{model.value}: "
-                        f"filling {start}→{prev_runs_start - timedelta(days=1)} from reanalysis archive...",
+                        f"[calibrate]   {city_key}/{model.value}/{lead_hours}h: "
+                        f"fetching real forecasts {prev_runs_start}→{end} "
+                        f"(previous-runs lead_days={lead_days})...",
                         file=sys.stderr,
                     )
-                    archive_hist = self.grib.fetch_historical_highs(
-                        station, model, start=start, end=prev_runs_start - timedelta(days=1)
+                    archive_prev = self.grib.fetch_archived_forecasts(
+                        station, model,
+                        start=prev_runs_start, end=end,
+                        lead_days=lead_days,
                     )
 
-                # Merge: real forecasts override reanalysis where both exist
-                archive = {**archive_hist, **archive_prev}
-                print(
-                    f"[calibrate]   {city_key}/{model.value}: "
-                    f"{len(archive_prev)} real-forecast days + {len(archive_hist)} reanalysis days "
-                    f"= {len(archive)} total",
-                    file=sys.stderr,
-                )
-
-                for obs_date, observed_f in obs_lookup.items():
-                    forecast_f = archive.get(obs_date)
-                    if forecast_f is None:
-                        continue
-                    error = forecast_f - observed_f
-                    # Use STABLE_HIGH as the default regime (upper-air classification
-                    # requires GRIB fields not yet fetched during historical runs).
-                    self.db.save_forecast_error(
-                        ForecastError(
-                            city=city_key,
-                            model=model,
-                            regime=SynopticRegime.STABLE_HIGH,
-                            lead_hours=24,
-                            error_f=error,
-                            obs_date=obs_date,
+                    # Fill older dates from reanalysis archive — 24h-lead only.
+                    # σ floor in BracketProbabilityCalculator (2.5°F) prevents
+                    # overconfidence from reanalysis samples.
+                    archive_hist: dict[date, float] = {}
+                    if allow_reanalysis and start < prev_runs_start:
+                        print(
+                            f"[calibrate]   {city_key}/{model.value}/{lead_hours}h: "
+                            f"filling {start}→{prev_runs_start - timedelta(days=1)} "
+                            f"from reanalysis archive...",
+                            file=sys.stderr,
                         )
+                        archive_hist = self.grib.fetch_historical_highs(
+                            station, model,
+                            start=start,
+                            end=prev_runs_start - timedelta(days=1),
+                        )
+
+                    # Merge: real forecasts override reanalysis where both exist
+                    archive = {**archive_hist, **archive_prev}
+                    print(
+                        f"[calibrate]   {city_key}/{model.value}/{lead_hours}h: "
+                        f"{len(archive_prev)} real-forecast days + "
+                        f"{len(archive_hist)} reanalysis days = {len(archive)} total",
+                        file=sys.stderr,
                     )
+
+                    for obs_date, observed_f in obs_lookup.items():
+                        forecast_f = archive.get(obs_date)
+                        if forecast_f is None:
+                            continue
+                        error = forecast_f - observed_f
+                        # Use STABLE_HIGH as the default regime (upper-air
+                        # classification requires GRIB fields not yet fetched
+                        # during historical runs). lead_hours tagged per the
+                        # schedule above so _load_dists can look up the right
+                        # bucket at inference — no more √(lead/24) σ-scaling
+                        # fallback needed for 24h + 48h cases.
+                        self.db.save_forecast_error(
+                            ForecastError(
+                                city=city_key,
+                                model=model,
+                                regime=SynopticRegime.STABLE_HIGH,
+                                lead_hours=lead_hours,
+                                error_f=error,
+                                obs_date=obs_date,
+                            )
+                        )
 
                 for regime in SynopticRegime:
                     for lead_bucket in [6, 12, 24, 48, 72]:
