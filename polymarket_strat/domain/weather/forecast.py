@@ -26,13 +26,60 @@ DEFAULT_WEIGHTS: dict[WeatherModel, float] = {
     WeatherModel.NAM: 0.10,
 }
 
-# Minimum realistic σ for 24h NWP daily-max temperature forecasts (°F).
-# Calibration uses Open-Meteo archive (reanalysis blend), which has seen the
+# Minimum realistic σ for NWP daily-max temperature forecasts (°F).
+#
+# Historical motivation (Apr 2026, pre-real-forecast era):
+# Calibration used Open-Meteo *archive* (reanalysis blend), which has seen the
 # observations and produces σ ≈ 0.9-1.5°F — 2-4x tighter than real operational
-# forecast errors (~2.5-4°F per NWS verification statistics).
-# This floor prevents the overconfident bracket probabilities that result from
-# comparing reanalysis-to-reanalysis instead of forecast-to-observation.
-_SIGMA_FLOOR_F: float = 2.5
+# forecast errors (~2.5-4°F per NWS verification statistics). Without a floor,
+# bracket probabilities were systematically overconfident by 4-7x on narrow
+# exact-degree brackets (70% spuriously becoming 52%).
+#
+# Current motivation (Apr 21 2026, after regime backfill at both leads):
+# 91 days of real-forecast previous-runs data now exists per (city, model, 24h)
+# bucket. The 24h walk-forward reliability diagram shows the OPPOSITE problem:
+# model is systematically UNDER-confident in middle bins (mean_pred 0.514 vs
+# hit_rate 0.664 at pm_2F) and OVER-confident at tails (mean_pred 0.039 vs
+# hit_rate 0.014 at above_F+5). Classic spread-too-wide signature — σ is too
+# high, not too low. Relaxing the floor to 2.0°F on buckets that have enough
+# real-forecast samples narrows the distribution toward the truth without
+# regressing thin-data buckets.
+#
+# The conditional floor (see _effective_sigma_floor) keeps the 2.5°F guardrail
+# at leads or buckets that haven't accumulated enough real-forecast rows to
+# earn the relaxation.
+_SIGMA_FLOOR_F_REANALYSIS: float = 2.5   # default / safety net
+_SIGMA_FLOOR_F_REAL: float = 2.0         # relaxed floor once bucket is "earned"
+
+# How many real-forecast samples a (city, model, regime, lead) bucket needs
+# before its MLE σ is trusted enough to drop the floor.
+_N_REAL_FORECAST_THRESHOLD: int = 60
+
+# Leads at which the relaxed floor is allowed. 24h has ~91 real-forecast days
+# per (city, model) pair. 48h has fewer and is still partly reanalysis-padded,
+# so leave it on the conservative floor until coverage catches up.
+_RELAXED_FLOOR_LEADS: frozenset[int] = frozenset({24})
+
+# Back-compat alias for anyone importing _SIGMA_FLOOR_F — points to the
+# reanalysis-era default so external callers stay on the safe side.
+_SIGMA_FLOOR_F: float = _SIGMA_FLOOR_F_REANALYSIS
+
+
+def _effective_sigma_floor(error_dist: ErrorDistribution) -> float:
+    """Choose the σ floor for a given calibrated distribution.
+
+    Returns the relaxed 2.0°F floor only when BOTH conditions hold:
+      * bucket is at a lead where relaxation is allowed (24h today)
+      * MLE fit was backed by >= _N_REAL_FORECAST_THRESHOLD samples
+
+    Otherwise returns the 2.5°F reanalysis-era guardrail.
+    """
+    if (
+        error_dist.lead_hours in _RELAXED_FLOOR_LEADS
+        and error_dist.n_samples >= _N_REAL_FORECAST_THRESHOLD
+    ):
+        return _SIGMA_FLOOR_F_REAL
+    return _SIGMA_FLOOR_F_REANALYSIS
 
 
 def _error_cdf(x: float, dist: ErrorDistribution) -> float:
@@ -75,11 +122,11 @@ class BracketProbabilityCalculator:
               = P(forecast - upper < error <= forecast - lower)
               = CDF_error(forecast - lower) - CDF_error(forecast - upper)
 
-        σ is clamped to _SIGMA_FLOOR_F before evaluation.  The archive-derived
-        distributions have σ ≈ 0.9-1.5°F because reanalysis has assimilated the
-        observations; real 24h operational forecast σ is 2.5-4°F.  Without the
-        floor, model_probs for narrow exact-degree brackets are overconfident by
-        a factor of 4-7x (e.g., 70% becomes 52%).
+        σ is clamped to `_effective_sigma_floor(error_dist)` before evaluation.
+        That returns 2.0°F for (lead=24h, n_samples >= 60) buckets that have
+        accumulated enough real-forecast rows to trust their MLE σ, and 2.5°F
+        everywhere else (long leads, thin buckets, reanalysis-heavy fits).
+        See the module-level comments for the full rationale.
         """
         floored = ErrorDistribution(
             city=error_dist.city,
@@ -88,7 +135,7 @@ class BracketProbabilityCalculator:
             lead_hours=error_dist.lead_hours,
             family=error_dist.family,
             mu=error_dist.mu,
-            sigma=max(error_dist.sigma, _SIGMA_FLOOR_F),
+            sigma=max(error_dist.sigma, _effective_sigma_floor(error_dist)),
             shape=error_dist.shape,
             nu=error_dist.nu,
             n_samples=error_dist.n_samples,
