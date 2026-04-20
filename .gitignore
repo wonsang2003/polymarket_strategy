@@ -99,7 +99,6 @@ _backfill_head.txt
 deploy/_*.sh
 deploy/_*.applescript
 deploy/_*.py
-deploy/upload_to_ec2.sh
 
 # Generated / data
 data/weather/
