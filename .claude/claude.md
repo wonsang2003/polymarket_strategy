@@ -507,6 +507,11 @@ sqlite3                               # stdlib
 8. Musk alpha stays frozen until weather clears Phase 2.
 
 ### Completed since last spec update
+- **Settlement conditionId-vs-id fix (Apr 23 2026)**: root cause of "positions never resolve on EC2 even when outcomePrices is 1.0". `_resolve_via_polymarket` in `main.py` calls `client.get_market(mkt_id)` which hit `GET /markets/{mkt_id}`. Gamma's path parameter accepts only the numeric `id`, but `market_scanner.py:291` was saving `str(market.get("conditionId") or market.get("id"))` → every existing trade_history row has a 0x-hex conditionId in `market_id`, and every hourly settle call returned 404 → `_resolve_via_polymarket → None` → IEM fallback (gated on `target_date < today`) → same-day resolutions stuck forever. Two-part fix:
+  - `api.py::get_market` now detects `0x`-prefix and routes to `GET /markets?condition_ids=<id>&limit=1` (list endpoint with filter, which *does* accept the hash form), returning the single hit or `{}`. Numeric ids still hit the path endpoint. Empty string → `{}` with no RPC (guards against NULL legacy rows).
+  - `market_scanner.py:291` flipped the fallback so new rows prefer numeric `id`; `conditionId` is now the fallback. Legacy rows remain resolvable via the `api.py` dispatch — no migration script needed.
+  - Tests: 6 new cases in `tests/test_settle.py::TestGammaGetMarketDispatch` pin numeric→path, conditionId→list, uppercase `0X`, whitespace strip, empty-id short-circuit, empty-list-returns-empty-dict. Existing 10 `TestResolveViaPolymarket` cases still green (they mock `get_market` so they're orthogonal to the dispatch). Full suite: 210 passed, 2 pre-existing sandbox PermissionErrors (not caused by this fix).
+  - **EC2 deploy**: `git pull && python -m polymarket_strat.main settle --auto` on the hourly-cron Mac/EC2. First post-fix run should clear the backlog of same-day-resolved-but-never-settled rows in one pass. No DB migration needed.
 - WAL mode + rotated SQLite backups (`scripts/backup_db.py`).
 - Lag monitor (`tools/lag_monitor/`) — ready to deploy; waiting on 2 weeks of data.
 - `fit_bayesian()` + `summarize_posterior()` implemented with PyMC.

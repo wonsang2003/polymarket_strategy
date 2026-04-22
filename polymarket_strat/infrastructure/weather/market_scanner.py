@@ -288,7 +288,12 @@ class WeatherMarketScanner:
             if len(outcomes) < 2 or len(outcomes) != len(token_ids):
                 continue
 
-            market_id = str(market.get("conditionId") or market.get("id") or "")
+            # Prefer numeric `id` — Gamma's `/markets/{id}` path parameter only
+            # accepts the numeric form. `conditionId` is the fallback for
+            # conditions where `id` is absent (rare) — `PolymarketPublicClient.
+            # get_market` handles both transparently, but new rows persist the
+            # cleaner path-compatible form so settlement is one RPC not two.
+            market_id = str(market.get("id") or market.get("conditionId") or "")
             best_ask = float(market.get("bestAsk") or 1.0)
             best_bid = float(market.get("bestBid") or 0.0)
             spread = float(market.get("spread") or (best_ask - best_bid))

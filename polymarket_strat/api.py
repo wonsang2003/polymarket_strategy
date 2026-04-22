@@ -59,7 +59,24 @@ class PolymarketPublicClient:
         return list(self._get(GAMMA_BASE_URL, "/markets", params))
 
     def get_market(self, market_id: str) -> dict[str, Any]:
-        return dict(self._get(GAMMA_BASE_URL, f"/markets/{market_id}"))
+        """Fetch a single market by numeric id OR 0x-prefixed conditionId.
+
+        Gamma's `GET /markets/{id}` path parameter accepts only the numeric
+        `id` field. Passing a conditionId (0x-prefixed 32-byte hex) returns
+        404 and breaks downstream settlement. Forwards-compat: detect the
+        0x prefix and route to the list endpoint with a `condition_ids`
+        filter, which *does* accept the hash form and returns a 1-element
+        array. Empty id → empty dict (guard against legacy NULL rows).
+        """
+        if not market_id:
+            return {}
+        ident = str(market_id).strip()
+        if ident.lower().startswith("0x"):
+            rows = list(
+                self._get(GAMMA_BASE_URL, "/markets", {"condition_ids": ident, "limit": 1})
+            )
+            return dict(rows[0]) if rows else {}
+        return dict(self._get(GAMMA_BASE_URL, f"/markets/{ident}"))
 
     def get_events(
         self,
