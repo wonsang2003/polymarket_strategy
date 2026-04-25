@@ -20,3 +20,28 @@ TZ=Asia/Seoul
 
 # Daily HTML report regeneration at 05:00 KST
 0 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat report >> /home/ubuntu/polymarket/logs/report.log 2>&1
+
+# Apr 24 2026 — accuracy-layer refresh jobs. Each runs nightly after
+# calibration and uses the freshest available data:
+#   fit_isotonic        : per-(city, lead) calibration curves from walk-forward CSV
+#   fit_reliability     : per-city Brier + sample-count → position sizing multiplier
+#   fit_bucket_blocklist: data-driven (city, lead, regime) auto-block from trade_history
+# All three are idempotent and fail-safe (graceful fallback to identity /
+# unblocked / multiplier=1.0 when input data is missing).
+5 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_isotonic.py >> /home/ubuntu/polymarket/logs/fit_isotonic.log 2>&1
+10 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_reliability.py >> /home/ubuntu/polymarket/logs/fit_reliability.log 2>&1
+15 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_bucket_blocklist.py >> /home/ubuntu/polymarket/logs/fit_bucket_blocklist.log 2>&1
+
+# Apr 25 2026 — per-city ECE shrinkage refresh.
+# Order matters: honest_ece.py must run BEFORE compute_per_city_ece (which
+# reads its output). And compute_per_city_ece must run AFTER fit_reliability
+# (which writes the base reliability.json that compute_per_city_ece extends).
+# Time slots: 05:20 honest_ece (slow ~7min), 05:30 compute_per_city_ece (fast).
+20 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/honest_ece.py --leads 24 --external-climatology data/weather/climatology.json >> /home/ubuntu/polymarket/logs/honest_ece.log 2>&1
+30 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/compute_per_city_ece.py >> /home/ubuntu/polymarket/logs/compute_per_city_ece.log 2>&1
+
+# Apr 26 2026 — fix #2: NO-side isotonic from real settled NO trades.
+# Independent of fit_isotonic.py (which fits YES-side from synthetic walk-forward).
+# Runs after compute_per_city_ece at 05:35 KST. Reads trade_history directly,
+# so it always has the freshest data (no dependency on walk-forward CSVs).
+35 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_no_isotonic.py >> /home/ubuntu/polymarket/logs/fit_no_isotonic.log 2>&1
