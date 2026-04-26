@@ -76,9 +76,15 @@ st.set_page_config(
 )
 
 # Auto-refresh wiring — invalidates st.cache_data and re-runs the script
-# every 30s so new trades appear without F5. The component returns a
+# every 10s so new trades appear without F5. The component returns a
 # count of refreshes; we don't use it but the call must happen.
-_REFRESH_INTERVAL_MS = 30_000  # 30 seconds
+#
+# Apr 27 2026 — interval shortened from 30s to 10s after a "dashboard not
+# updating" report. With cron writes happening at top of hour and tail-NO
+# placements firing within the same minute, 30s could leave the user
+# staring at 30-90s-old data depending on the auto-refresh phase. 10s
+# means worst-case staleness ≤ 15s (10s refresh + 5s cache TTL).
+_REFRESH_INTERVAL_MS = 10_000  # 10 seconds
 if _AUTO_REFRESH_AVAILABLE:
     st_autorefresh(interval=_REFRESH_INTERVAL_MS, key="dashboard_autorefresh")
 else:
@@ -113,11 +119,11 @@ def ro_connection(path: Path) -> sqlite3.Connection:
     return conn
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def fetch_df(_conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
-    # ttl=15 (was 60) so the 30s auto-refresh always gets fresh data.
-    # Some queries within a single rerun hit the cache; the next rerun
-    # re-fetches everything.
+    # Apr 27 2026 — ttl=5 (was 15). With auto-refresh at 10s the cache only
+    # serves the queries within ONE rerun (deduplicating identical reads
+    # within a single render). Next rerun always re-fetches.
     return pd.read_sql_query(sql, _conn, params=params)
 
 
@@ -126,13 +132,67 @@ def fetch_df(_conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.Data
 # ---------------------------------------------------------------------------
 
 st.title("Polymarket Weather Alpha — Dashboard")
-st.caption(f"DB: `{DB_PATH}` — read-only. Data cached 60s.")
 
 if not DB_PATH.exists():
     st.error(f"Database not found at {DB_PATH}. Run calibration first.")
     st.stop()
 
 conn = ro_connection(DB_PATH)
+
+# Apr 27 2026 — explicit freshness header. Tells the user three things at a
+# glance:
+#   - When this page rendered (browser-perspective)
+#   - When the DB was last written to (pipeline-perspective)
+#   - A manual "Refresh now" button that forces a full cache+rerun cycle
+#
+# Why this matters: the auto-refresh + cache TTL combo can leave up to 15s
+# of staleness, and Chrome throttles backgrounded tabs (auto-refresh stops
+# firing entirely). Without an explicit freshness indicator, the user
+# can't distinguish "dashboard is stuck" from "no new trades to show".
+from datetime import timezone as _tz
+_now_utc = datetime.now(_tz.utc)
+try:
+    _latest_create = pd.to_datetime(
+        conn.execute("SELECT MAX(created_at) FROM trade_history").fetchone()[0],
+        utc=True, errors="coerce",
+    )
+    _latest_settle = pd.to_datetime(
+        conn.execute(
+            "SELECT MAX(settled_at) FROM trade_history WHERE settled_at IS NOT NULL"
+        ).fetchone()[0],
+        utc=True, errors="coerce",
+    )
+except Exception:
+    _latest_create = pd.NaT
+    _latest_settle = pd.NaT
+
+def _ago(ts) -> str:
+    if pd.isna(ts):
+        return "—"
+    delta_s = (_now_utc - ts.to_pydatetime()).total_seconds()
+    if delta_s < 60:
+        return f"{int(delta_s)}s ago"
+    if delta_s < 3600:
+        return f"{int(delta_s/60)}m ago"
+    if delta_s < 86400:
+        return f"{int(delta_s/3600)}h ago"
+    return f"{int(delta_s/86400)}d ago"
+
+_h_cols = st.columns([3, 3, 3, 1])
+with _h_cols[0]:
+    st.caption(f"DB: `{DB_PATH.name}` — read-only")
+with _h_cols[1]:
+    st.caption(f"Last DB write: **{_ago(_latest_create)}** (created), "
+               f"**{_ago(_latest_settle)}** (settled)")
+with _h_cols[2]:
+    st.caption(
+        f"Rendered: {_now_utc.strftime('%H:%M:%S UTC')} • "
+        f"auto-refresh every {_REFRESH_INTERVAL_MS // 1000}s"
+    )
+with _h_cols[3]:
+    if st.button("↻ Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # KPI strip
@@ -484,5 +544,7 @@ st.divider()
 st.caption(
     "Read-only dashboard. For execution, use the CLI: "
     "`polymarket-strat autotrade / positions / settle --auto`. "
-    "Rendered {}.".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    "Rendered {}.".format(
+        datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
 )
