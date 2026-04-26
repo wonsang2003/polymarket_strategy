@@ -153,6 +153,14 @@ def run_execute(strategy_name: str, *, use_sample: bool, mode: str, state_path: 
                 entry_price=float(item.best_ask),
                 notional=float(item.target_notional),
             )
+            # Apr 27 2026 — canonical edge/token_side convention. See main
+            # save_trade call below for full rationale.
+            _edge_pp = meta.get("edge_after_fees")
+            if _edge_pp is None:
+                _edge_pp = item.expected_value
+            _token_side = meta.get("token_side")
+            if not _token_side:
+                _token_side = "NO" if "NO" in (item.side or "").upper() else "YES"
             trade_id = weather_db.save_trade(
                 city=meta.get("city", ""),
                 target_date=tdate,
@@ -160,7 +168,7 @@ def run_execute(strategy_name: str, *, use_sample: bool, mode: str, state_path: 
                 bracket_upper_f=float(meta.get("bracket_upper_f", 0.0)),
                 model_prob=float(meta.get("model_prob", 0.0)),
                 market_prob=float(item.reference_price),
-                edge=float(item.expected_value),
+                edge=float(_edge_pp),
                 kelly_fraction=float(meta.get("kelly_fraction", 0.0)),
                 notional=float(item.target_notional),
                 entry_price=float(item.best_ask),
@@ -175,11 +183,12 @@ def run_execute(strategy_name: str, *, use_sample: bool, mode: str, state_path: 
                 # at fill (computed by forecast.py::edge), content hash = the
                 # forecast fingerprint the plan was built on. Both feed into
                 # run_rebalance's dual-threshold decision at the next cycle.
-                entry_edge=float(meta.get("edge_after_fees", item.expected_value)),
+                entry_edge=float(_edge_pp),
                 forecast_content_hash=str(meta.get("forecast_content_hash") or ""),
                 # Apr 24 2026 (Citadel fix #5) — which side (YES or NO) was
-                # picked by strategy. Defaults to "YES" on legacy rows.
-                token_side=str(meta.get("token_side") or "YES"),
+                # picked by strategy. Apr 27 2026: now derives from item.side
+                # if metadata.token_side is missing.
+                token_side=str(_token_side),
                 # Apr 24 2026 (data expansion) — per-model forecast diagnostics
                 # extracted from signal.metadata. Enables full posthoc
                 # analysis: "was GFS off, was ECMWF off, what was the
@@ -1938,6 +1947,22 @@ def run_autotrade(
                 entry_price=float(item.best_ask),
                 notional=float(item.target_notional),
             )
+            # Apr 27 2026 — canonical edge/token_side convention. Read PP-unit
+            # edge from metadata explicitly. Strategies populate
+            #   metadata["edge_after_fees"]  → fee-adjusted PP gap (0..0.5)
+            #   metadata["model_prob"]       → side's P(win) (0..1)
+            #   metadata["token_side"]       → "YES" or "NO"
+            # Falling back to item.expected_value pollutes the column with
+            # USD EV for strategies that set it that way (tail-NO did before
+            # this fix). See CLAUDE §15.x edge-convention audit.
+            _edge_pp = meta.get("edge_after_fees")
+            if _edge_pp is None:
+                _edge_pp = item.expected_value
+            _token_side = meta.get("token_side")
+            if not _token_side:
+                # Derive from item.side as a safety net for strategies that
+                # don't populate metadata. "BUY_NO" → NO, anything else → YES.
+                _token_side = "NO" if "NO" in (item.side or "").upper() else "YES"
             db.save_trade(
                 city=meta.get("city", ""),
                 target_date=tdate,
@@ -1945,7 +1970,7 @@ def run_autotrade(
                 bracket_upper_f=float(meta.get("bracket_upper_f", 0)),
                 model_prob=float(meta.get("model_prob", 0)),
                 market_prob=float(item.reference_price),
-                edge=float(item.expected_value),
+                edge=float(_edge_pp),
                 kelly_fraction=float(meta.get("kelly_fraction", 0)),
                 notional=float(item.target_notional),
                 entry_price=float(item.best_ask),
@@ -1956,8 +1981,9 @@ def run_autotrade(
                 question=item.question,
                 regime=meta.get("regime"),
                 expected_pnl=expected_ev,
+                token_side=str(_token_side),
                 # See run_execute — rebalance baseline columns.
-                entry_edge=float(meta.get("edge_after_fees", item.expected_value)),
+                entry_edge=float(_edge_pp),
                 forecast_content_hash=str(meta.get("forecast_content_hash") or ""),
                 # Apr 26 2026 — strategy provenance for rebalance skip-list.
                 # tail-NO trades are buy-and-hold; rebalance keys off this.
