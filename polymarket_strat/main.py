@@ -632,6 +632,8 @@ def _run_tail_no_strategy_pass(
     Returns:
         (list[TradePlan], diagnostics dict)
     """
+    import sys
+
     from polymarket_strat.api import PolymarketPublicClient
     from polymarket_strat.domain.weather.tail_no_strategy import (
         analyze_tail_no_brackets, EmpiricalHitRate,
@@ -700,15 +702,13 @@ def _run_tail_no_strategy_pass(
         return [], {"n_evaluated": 0, "skipped": "no_forecasts"}
 
     # 3. Pull already-open + cooldown tokens from DB.
-    already_open = set()
-    cooldown = set()
+    already_open: set[str] = set()
+    cooldown: set[str] = set()
     try:
-        cur = db.connection.cursor()
-        rows = cur.execute(
-            "SELECT token_id FROM trade_history "
-            "WHERE outcome IS NULL AND token_id IS NOT NULL"
-        ).fetchall()
-        already_open = {r[0] for r in rows if r[0]}
+        for pos in db.get_open_positions():
+            tid = pos.get("token_id")
+            if tid:
+                already_open.add(tid)
         cooldown = db.get_cooldown_tokens()
     except Exception as exc:
         print(f"[tail_no] cooldown/open lookup error: {exc!r}",
