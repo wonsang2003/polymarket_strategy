@@ -216,6 +216,11 @@ def run_execute(strategy_name: str, *, use_sample: bool, mode: str, state_path: 
                     if meta.get("season") is not None
                     else None
                 ),
+                # Apr 26 2026 — strategy provenance for rebalance skip-list
+                # and downstream analytics. NULL on legacy mainstream rows;
+                # set to "weather_tail_no" / "weather_tail_no" on tail-NO.
+                category=item.category or None,
+                strategy_name=item.strategy_name or None,
             )
             order_dict["trade_id"] = trade_id
             order_dict["expected_pnl"] = expected_ev
@@ -1954,6 +1959,10 @@ def run_autotrade(
                 # See run_execute — rebalance baseline columns.
                 entry_edge=float(meta.get("edge_after_fees", item.expected_value)),
                 forecast_content_hash=str(meta.get("forecast_content_hash") or ""),
+                # Apr 26 2026 — strategy provenance for rebalance skip-list.
+                # tail-NO trades are buy-and-hold; rebalance keys off this.
+                category=item.category or None,
+                strategy_name=item.strategy_name or None,
             )
 
             # Update portfolio state
