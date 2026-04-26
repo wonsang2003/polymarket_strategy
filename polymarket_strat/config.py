@@ -112,8 +112,18 @@ class TradingConstraints:
     max_category_notional: float = 100.0
     max_correlated_positions: int = 2
     reserve_cash_ratio: float = 0.35
-    drawdown_soft_limit: float = 0.08
-    drawdown_hard_limit: float = 0.15
+    # Apr 25 2026 (LATE) — DISABLED for paper-mode data collection.
+    # User decision: collect maximum trade tape during Phase 1 paper trading
+    # so calibration / per-city ECE / live rebalance behavior all see real
+    # Polymarket bracket outcomes across a wide range of conditions. The
+    # mathematical effect of values >= 1.0 is that the drawdown comparator
+    # `if drawdown >= soft_limit` never triggers (drawdown ∈ [0, 1] by
+    # construction in PortfolioState.drawdown). risk.py's `drawdown_multiplier`
+    # therefore stays at 1.0 always, and the hard-limit short-circuit in
+    # PortfolioRiskManager is unreachable.
+    # Re-enable to e.g. 0.08/0.15 before flipping to live mode.
+    drawdown_soft_limit: float = 1.0
+    drawdown_hard_limit: float = 1.0
     confidence_boost: float = 1.10
     liquidity_haircut: float = 0.60
     slippage_haircut_per_spread: float = 1.50
@@ -136,11 +146,55 @@ class TradingConstraints:
     #     5¢ cutoff. Justified by walk-forward: market-band + flat edge
     #     is already sufficient to dominate Sharpe + model-prob filters.
     # ------------------------------------------------------------------
-    max_position_fraction: float = 0.05
-    min_position_notional_usd: float = 10.0
+    # Apr 25 2026 — PLAN B emergency: halve per-position fraction (5% → 2.5%)
+    # and reduce min notional ($10 → $5). With a $200 paper bankroll the
+    # effective per-trade risk drops from $10 to $5. This caps damage if
+    # any new high-p artifacts slip past the gate while we wait for
+    # isotonic calibration data to mature on the surviving cities (NYC,
+    # London, Tokyo, Seoul, Shanghai, HK, Atlanta, Chicago, Dubai, Sydney).
+    # Reinstate to 5%/$10 once we see 2-3 days of positive cumulative
+    # P&L on the post-Plan-B trade tape.
+    max_position_fraction: float = 0.025
+    min_position_notional_usd: float = 5.0
     max_correlation_group_fraction: float = 0.15
-    max_daily_drawdown: float = 0.14
+    # Apr 25 2026 (LATE) — DISABLED for paper-mode data collection.
+    # Was 0.14 (14% × bankroll daily loss → autotrade brake). User decision:
+    # paper trading should never auto-pause; we want maximum trade tape to
+    # validate per-city ECE shrinkage and live rebalance behavior. Setting
+    # to 1.00 means "lock the day only after losing the entire bankroll" —
+    # effectively disabled. Re-enable to 0.14 before flipping live mode.
+    max_daily_drawdown: float = 1.0
     min_edge_flat: float = 0.05
+    # Apr 25 2026 — Layer 1 ML pricing feature flag. When True, the
+    # strategy.py per-side evaluation will try the quantile regression
+    # bracket pricer first and fall back to parametric only when the
+    # ML model is unavailable for the given (city, lead).
+    #
+    # Apr 25 2026 (FINAL) — RE-ENABLED after fixing climatology leak.
+    #
+    # Story:
+    #   1. Naive measure_ece reported 5.44% — flagged as suspicious by user.
+    #   2. Methodology audit caught 3 leak sources: 1-year-only climatology
+    #      (climo_mean ≈ actual obs), random train/test split, measure_ece
+    #      holdout overlap with training.
+    #   3. honest_ece.py with temporal split + train-only single-year climo
+    #      → 8.14% (real OOS, but 1-yr climo is too noisy).
+    #   4. Same with --mask-climatology → 6.92% but Brier 0.222 (model lost
+    #      discriminating power, just predicting ~0.5 a lot — rejected).
+    #   5. Built scripts/build_era5_climatology.py → fetched ERA5 1991-2020
+    #      daily Tmax for all 22 cities (median 30 obs per city/doy cell).
+    #      Climatology window doesn't overlap training data, so leak-free
+    #      by construction.
+    #   6. honest_ece.py with ERA5 climo → 4.45% aggregate ECE, well below
+    #      7% target, BETTER than the leaky naive 5.44%. Reliability bins:
+    #      [0.50,0.60) gap 0.8%, [0.60,0.70) gap 3.0%, [0.70,0.80) gap 0.8%
+    #      — the previously-broken trading sweet spot is now well calibrated.
+    #
+    # Production climatology.json on EC2 is the ERA5 30-yr build. Quantile
+    # models retrained against that climatology after the install.
+    # Override-block in strategy.py falls back silently to parametric when
+    # no quantile model exists.
+    use_quantile_pricing: bool = True
 
 
 @dataclass(slots=True)

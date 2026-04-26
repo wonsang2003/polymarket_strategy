@@ -85,14 +85,24 @@ step "4) Smoke test (polymarket-strat doctor)"
 
 # ---- 5. cron
 step "5) Install cron jobs"
-# preserve any unrelated existing entries; replace the polymarket block
-TMPCRON=$(mktemp)
-crontab -l 2>/dev/null | grep -v "polymarket" > "$TMPCRON" || true
-cat "$REPO_ROOT/deploy/cron_jobs.crontab" >> "$TMPCRON"
-crontab "$TMPCRON"
-rm "$TMPCRON"
-echo "  Installed:"
-crontab -l | grep -E "(polymarket|TZ|SHELL|PATH)" | sed 's/^/    /'
+# Previous version used `grep -v "polymarket"` (lowercase) which left the
+# `# Polymarket weather alpha — …` header comments in place. Re-running this
+# setup then appended the full cron_jobs.crontab again, accumulating one
+# extra header block per deploy. The actual job lines were deduped (they
+# contain lowercase `polymarket` in the command path) but the headers grew
+# without bound — observed 4 copies on EC2 by Apr 23 2026.
+#
+# Fix: replace the crontab outright. Polymarket is the only scheduled thing
+# on this host, so "preserve unrelated entries" was a theoretical concern
+# that in practice just meant "accumulate stale headers".
+if [[ -f "$REPO_ROOT/deploy/cron_jobs.crontab" ]]; then
+    crontab "$REPO_ROOT/deploy/cron_jobs.crontab"
+    echo "  Installed (clean replace):"
+else
+    echo "  MISSING $REPO_ROOT/deploy/cron_jobs.crontab" >&2
+    exit 1
+fi
+crontab -l | grep -E "^[^#[:space:]]" | sed 's/^/    /'
 
 # ---- 6. systemd dashboard service
 step "6) Install systemd dashboard service"

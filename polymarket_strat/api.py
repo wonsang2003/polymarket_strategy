@@ -67,15 +67,30 @@ class PolymarketPublicClient:
         0x prefix and route to the list endpoint with a `condition_ids`
         filter, which *does* accept the hash form and returns a 1-element
         array. Empty id → empty dict (guard against legacy NULL rows).
+
+        Two-pass on the 0x path: Gamma's list endpoint defaults to
+        `closed=false`, which hides exactly the markets settlement cares
+        about (Polymarket-resolved → `closed=true`). So we try default
+        first (cheaper, covers the common mid-life lookup case) and fall
+        back to an explicit `closed=true` query if empty. Without this
+        fallback, resolved Apr-22-style markets where `closed=True,
+        umaResolutionStatus=resolved, outcomePrices=["0","1"]` are
+        invisible to `_resolve_via_polymarket` and stay permanently open.
         """
         if not market_id:
             return {}
         ident = str(market_id).strip()
+        if not ident:
+            return {}
         if ident.lower().startswith("0x"):
-            rows = list(
-                self._get(GAMMA_BASE_URL, "/markets", {"condition_ids": ident, "limit": 1})
-            )
-            return dict(rows[0]) if rows else {}
+            for closed_flag in (None, "true"):
+                params: dict[str, Any] = {"condition_ids": ident, "limit": 1}
+                if closed_flag is not None:
+                    params["closed"] = closed_flag
+                rows = list(self._get(GAMMA_BASE_URL, "/markets", params))
+                if rows:
+                    return dict(rows[0])
+            return {}
         return dict(self._get(GAMMA_BASE_URL, f"/markets/{ident}"))
 
     def get_events(

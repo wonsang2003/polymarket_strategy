@@ -1,6 +1,6 @@
 # POLYMARKET QUANTITATIVE TRADING SYSTEM — WORKING SPEC
 
-**Last Updated:** April 19, 2026
+**Last Updated:** April 24, 2026
 **Current Mode:** PAPER — Weather alpha under validation
 **Secondary Alpha (Musk Tweets):** spec'd in `MUSK_SPEC.md`, zero code. Do not wire into main pipeline until weather clears its 30-day gate.
 
@@ -538,4 +538,103 @@ sqlite3                               # stdlib
 - **backfill_regimes.py `--lead-hours` flag (Apr 19 2026)**: script now accepts `--lead-hours {6,12,24,48,72}` to scope the `SELECT` + `UPDATE` to a single lead bucket. Required for the remaining 48h STABLE_HIGH gap: running the full backfill unscoped would overwrite already-correct 24h frontal_passage/transition labels with the re-classified value. Run `python scripts/backfill_regimes.py --lead-hours 48 --refit` to close the gap without collateral damage.
 - **Event-based market discovery (Apr 19 2026 late)**: `market_scanner.py::find_weather_bracket_markets` pivoted from flat-`/markets` scanning to event-first discovery. Root cause diagnosed from live Tokyo data: Polymarket bundles all brackets for a resolution day into one event (e.g. `highest-temperature-in-tokyo-on-april-20-2026` → 11 child markets from 15°C through 26°C-or-higher). The flat `/markets?order=volume24hr` feed only surfaces high-volume child markets; low-volume middle brackets (21°C, 22°C for Tokyo Apr 20) fell past offset=3000 and were silently dropped. New flow: (1) paginate `/events?active=true&closed=false` up to `max_events=5000`, (2) filter events whose title/slug contains a weather keyword, (3) walk each event's embedded `markets` array (or fall back to `/events/{id}` hydration if list response omits children), (4) union with flat `/markets` scan as legacy safety net (handles events without standard slug pattern), (5) dedupe by `conditionId`/`id`, then run existing per-market filters (closed/acceptingOrders/endDateIso/question-regex/bracket-parse). `PolymarketPublicClient` gained `get_events()` + `get_event()`. Scanner stderr now logs: `events scanned=N matched=M / flat=K / union=U`. Expected coverage jump: today's 66 contracts should climb closer to 100+ once every event's full bracket set is enumerated. See Tokyo Apr 19 diagnostic — event 387435 had 11 children, flat scan captured only the 4 open tail brackets by rank.
 
-Cross-referenced files: `MUSK_SPEC.md` for tweet alpha design, `reports/profitability_analysis.html` for MC equity-curve math, `reports/weather_alpha_workflow.html` for end-to-end pipeline diagram, `tools/dashboard/README.md` for remote-monitoring setup.
+---
+
+## 15. Open Problems — Apr 23 2026 Strategy Review
+
+Backlog captured from a directed strategy-review pass. Item numbering mirrors the user's discussion thread; §15.1 is being implemented today, §15.2 / §15.3 are deferred to after Phase 2 (or called out where earlier). Handoff context from a prior LLM session is stored in `polymarket handoff.pdf` (referenced below as "PDF §N").
+
+### 15.1.1 Landed Apr 26 2026 — Plan B tightening + narrow-bracket NO cap
+
+Triggered by the NO-side bleed across the 22:00–00:00 KST cycles (sao_paulo p=0.86 → −$2.21, munich p=0.77 → −$1.87, hong_kong p=0.92 → −$1.35, all on 1°C-wide brackets exiting via rebalance "breakeven_triggered"). Two changes in `polymarket_strat/domain/weather/strategy.py`:
+
+1. **Plan B high-p artifact cap tightened** from `(p > 0.85 AND edge > 0.20)` to `(p > 0.80 AND edge > 0.15)`. Constants `_PLAN_B_HIGH_P_CAP` and `_PLAN_B_HIGH_P_EDGE_TRIGGER` updated in place. The losing band concentrated in `p ∈ [0.77, 0.85]`, just below the old cap.
+2. **New narrow-bracket NO-side cap**: when `bracket_width_f < 2.0` (≈ 1°C contracts) AND `token_side == "NO"` AND `model_prob > 0.75`, reject. Counter `gate_rejects["narrow_bracket_no_cap"]`. Constants `_NARROW_BRACKET_WIDTH_F = 2.0` and `_NARROW_BRACKET_NO_MAX_P = 0.75`. Gate fires after Plan B and before the absurd-edge cap.
+
+Why narrow brackets specifically: Polymarket EU/Asia weather contracts are 1°C wide (~1.8°F), narrower than the ±2°F synthetic brackets the fine-bin ECE audit was run on, so honest_ece under-states real calibration error in the contracts we actually trade. Bracket P is hyper-sensitive to σ-estimation error when bracket width ≈ σ. YES-side is unaffected because the failure mode is asymmetric.
+
+Tests: `tests/test_plan_b_cap.py` — 8 new pinning tests (constant values, type contract, ordering invariants, US-vs-EU width sanity). Full suite 464 passed; 1 pre-existing failure is task #22 (UTC-vs-local date bug, unrelated).
+
+Loosening path: only after either (a) NO-side isotonic regression measurably reduces the high-P calibration gap on real settled NO trades, or (b) ≥ 60 days of real-forecast data per (city, model, lead) bucket relaxes σ. Don't loosen blindly.
+
+### 15.1 Landed Apr 24 2026 — Rebalance + MTM UI
+
+**Scope delivered end-to-end; EC2 deploy gated on user review.** The original §15.1 plan (negative-edge + late-phase decay + half-spread thresholds) was re-scoped to a **dual-threshold rule keyed on forecast content hash** after review. Implementation covers rebalance engine, per-position MTM dashboard, new CLI, schema migrations, telegram exit alerts, and 25 new regression tests. What shipped:
+
+**Rebalance rule (`main.py::run_rebalance`):**
+- `current_edge` is recomputed per open position every `autotrade` tick using live CLOB `best_ask` as `market_prob` and fresh `p_model` from refitted ensemble. `edge_after_fees = p_model − best_ask − 0.02 × best_ask × (1 − p_model)` (fee on winnings only, same formula as entry).
+- **Exit iff `current_edge ≤ entry_edge − threshold`** where threshold depends on whether the forecast content hash changed:
+  - `forecast_content_hash` UNCHANGED vs entry → threshold = **0.15** (market-only move, tolerate noise)
+  - `forecast_content_hash` CHANGED → threshold = **0.10** (fresh info, cut harder)
+- Hash helper `forecast_content_hash(forecasts)` lives in `domain/weather/forecast.py`: SHA256 of sorted `(model, round(F×100), lead_h)` tuples, 16-char truncated. Open-Meteo doesn't expose init_time — content hash is the next-best invariant and survives cache churn.
+- **Consistency guarantee**: both entry and rebalance drop HRRR/NAM at `lead > 36h` BEFORE hashing (see `strategy.py:_analyze_weather_brackets` and `main.py:run_rebalance`). Without this, hashes would flip whenever HRRR/NAM are gated, producing false "fresh info" signals.
+- Cache scope: `forecast_hash_cache[(city, lead_bucket)]` in both entry (inside `strategy.py`) and rebalance. Bucket = `_bucket_lead(lead_h)` with buckets `[6, 12, 24, 48, 72]`.
+- Exit mark: **`best_ask`** (conservative — "could I re-enter at this level?"). Paper-mode P&L uses `best_bid`: `gross = shares × (best_bid − entry_price); fee = 0.02 × gross if gross > 0 else 0; pnl = gross − fee`. Matches Polymarket fee-on-winnings-only.
+- Sentinel: exit rows are written with `outcome = 2` (distinct from 1=YES settlement, 0=NO settlement). Dashboards and P&L rollups treat `outcome = 2` as closed-rebalance, not a settlement.
+- **6-hour cooldown** on exited tokens. New `token_cooldown` table (PK `token_id`, `cooldown_until TIMESTAMP`). `run_autotrade` and `run_execute` union cooldowns into `already_open_token_ids` before scanning, so the same token can't re-enter on the next tick. Aligned with GFS refresh cadence (00/06/12/18Z).
+- **Legacy-row safety**: pre-migration rows have `entry_edge IS NULL` — rebalance skips these with a `"legacy_skip"` reason; they still settle normally through the existing IEM/polymarket resolution path.
+- **Horizon gates**: any position with `raw_lead_h ≤ 0` (past settlement) is skipped with `"past_settlement"` reason and left to normal settlement. `raw_lead_h > 48` positions are skipped with `"beyond_calibration_horizon"` — same 48h hard cap as entry (see §14 bullet). Positions that fail to fetch a usable orderbook get `"orderbook_fail"`.
+
+**Integration into `run_autotrade`:**
+- **Step 1b (rebalance)** runs BEFORE the market scan so any freed capital is reusable in the same tick. Wrapped in try/except; `NotImplementedError` from live-mode sell placement caught separately and logged.
+- **Step 1c (MTM snapshot)** runs AFTER rebalance so the snapshot reflects post-exit state. Writes one row per still-open position to `market_prices`.
+- `cycle["rebalance"]`, `cycle["mtm_snapshot_count"]`, `cycle["cooldown_token_count"]` added to autotrade result payload. Telegram summary surfaces rebalance counts + total exit P&L on the same tick; `send_exit_alert` is also fired inline by `run_rebalance` for real-time visibility.
+
+**Schema additions (`infrastructure/weather/persistence.py`):**
+- `market_prices` — `token_id TEXT, market_id TEXT, best_bid REAL, best_ask REAL, mid_price REAL, bid_size REAL, ask_size REAL, outcome_prices_json TEXT, fetched_at_utc TIMESTAMP`; PK `(token_id, fetched_at_utc)`.
+- `token_cooldown` — `token_id TEXT PRIMARY KEY, cooldown_until TIMESTAMP NOT NULL`.
+- `trade_history` gains `entry_edge REAL, forecast_content_hash TEXT` (NULL on legacy rows). Written at entry time by `save_trade` from `signal.metadata["edge_after_fees"]` and `signal.metadata["forecast_content_hash"]`.
+- Helpers: `WeatherDatabase.get_cooldown_tokens()`, `set_cooldown(token_id, until_utc)`, `save_market_price(snapshot)`, `latest_market_price(token_id)`.
+
+**CLI (`main.py::build_parser`):**
+- New subcommand `polymarket-strat rebalance [--mode paper|live] [--confirm-live] [--dry-run]`. Defaults to paper. Live mode refuses without `--confirm-live`. `--dry-run` logs exit decisions without writing to DB or placing sell orders.
+
+**Dashboard (`tools/dashboard/app.py`):**
+- Open Positions panel rewritten with correlated subquery `LEFT JOIN` to `market_prices` (latest row per token by `MAX(fetched_at_utc)`). Computed columns: `current_price` (best_bid), `mtm_value = shares × best_bid`, `unrealized_pnl = mtm_value − notional − 0.02 × max(0, mtm_value − notional)`, `pnl_pct`, `last_updated_local = fetched_at_utc → ZoneInfo(station.timezone)`.
+- Styler `.map(_color_pnl, ...)` colors `unrealized_pnl` / `pnl_pct` green/red, grey if no price snapshot yet.
+- Summary row aggregates MTM total, total unrealized P&L, and priced/total count.
+- Falls back to the legacy (entry-only) view when `market_prices` table doesn't exist — covers pre-Apr-24 DBs without a migration step.
+
+**Notifications (`notifications/telegram.py`):**
+- `send_exit_alert(exits, dry_run)` — per-exit line with city, question[:40], stale/fresh reason, `entry_edge → current_edge`, P&L. Total exit P&L trailer.
+- `send_autotrade_summary` gains a rebalance block (`N exits (+$X), M holds`) and cooldown-token count.
+
+**Tests (`tests/test_rebalance.py` — 25 new, all green):**
+- `TestComputeCurrentEdge` (4) — positive/zero/negative edge, fee override.
+- `TestStationLocalLead` (4) — pre-lockin same-day, post-lockin negative, D+1, bad timezone.
+- `TestBestPriceFromBook` (6) — best bid/ask, empty/missing side, malformed prices, zero-price filter.
+- `TestRunRebalance` (8) — hold, stale-hash-exit, fresh-hash-exit, dry-run, cooldown write, legacy skip, past-settlement skip, orderbook-fail skip. Uses `_stable_hash_for_stub()` helper to deterministically compute `forecast_content_hash(_stub_forecasts())` so entry-vs-rebalance hash parity is guaranteed without hardcoded strings.
+- `TestSnapshotOpenPositions` (3) — writes one row per open, orderbook-fail doesn't crash, no-positions is a no-op.
+
+**Deferred (not shipped today — lives in §15.3):**
+- §15.3.6 opportunity-cost exit branch (mini-scan at each rebalance tick).
+- §15.3.7 fractional-Kelly tightening post-rebalance (re-decide after 14 days of paper equity variance).
+- Add-to-existing-position logic when `current_edge > entry_edge + Δ` — §15.3.9 new backlog item.
+- Live-mode sell placement (raises `NotImplementedError` on purpose; gated behind Phase 3).
+
+**Operational gating:** `paper` is default; `run_rebalance(mode="live")` raises unless `--confirm-live` is passed. Even with `--confirm-live`, the executor currently raises `NotImplementedError` on sell-side placement — an intentional Phase-3 gate. Paper mode is fully wired and ready for EC2 cron. **Awaiting user review before EC2 deploy.**
+
+### 15.2 Model / data backlog
+
+1. **Reliability index per (city, model, regime, lead).** All calibrated distributions currently treated as equally trustworthy past the outlier filter (|μ|>5 or σ>5). Need composite metric — `reliability = f(n_real_samples, brier_skill_at_lead, walkforward_reliability_gap)`. Downstream consumers: `strategy.py:analyze` edge threshold (§15.3.1) and `risk.py:position_size` Kelly shrinkage. Low-reliability (city, lead) pairs get higher edge requirement and smaller max position. Continuous analog of the binary post-hoc Phase-2 (city, lead) EV block (§11).
+2. **Live nowcast integration.** PDF §4 time-weighted ensemble: T-6h to T-1h should be nowcast-dominated (~90% weight on nearby-station real-time trends). Currently zero code. Requires collector daemon (not a cron tick), new `observations_hourly` table, Bayesian update of forecast prior: `p(T_final | obs) ∝ p(obs | T_final) · p(T_final | forecast)`. Est 3–4 weeks. Gate: after Phase 2 clears.
+3. **Per-city data-coverage diagnostics surface.** Dashboard panel showing `n_real_samples` + `n_reanalysis` per (city, model, lead) with traffic-light flag below ~30 real days. Complements reliability index; gives operator-visible signal of which cities lack data. Partial implementation already via calibration-health panel — extend to break out real vs reanalysis counts.
+4. **Additional data sources to evaluate.** NEXRAD radar (precip/gust leading indicators), GOES-16/18 satellite, Mesonet via Synoptic API, WU PWS. No budget spend until nowcast baseline is live and marginal Brier is measured.
+5. **Calibration gap-shrinkage.** Already ranked in §14 priority 7 — σ floor relaxation, MLE sample-weighting of real-forecast over reanalysis, isotonic regression, temperature scaling. 24h [0.4, 0.7) under-confidence is the target; 48h already well-calibrated.
+6. **48h regime backfill.** §14 priority 1. One-command: `python scripts/backfill_regimes.py --lead-hours 48 --refit`. Blocks meaningful reliability-index computation at the 48h bucket since all 48h `forecast_errors` rows are still `STABLE_HIGH`.
+
+### 15.3 Strategy / product backlog
+
+1. **Reliability-aware sizing.** Feed reliability index (§15.2.1) into Kelly: `f_sized = f_kelly × (1 / (1 + CV²)) × reliability`. Feed into edge threshold: `min_edge = min_edge_flat + α × (1 − reliability)`. α calibrated from walk-forward CSVs.
+2. **Lead-dependent edge threshold.** Current `min_edge_flat = 5¢` regardless of lead. Walk-forward: 24h Brier +0.479 vs 48h +0.421 — only 12% skill drop. Likely 48h needs ~7–8¢, not 10¢. Calibrate empirically from `tools/walk_forward/last_run_24h.csv` + `last_run_48h.csv` by finding `min_edge(lead)` where realized EV = 0 per bucket. **Do not copy** the PDF's `SPREAD × (2 + 3 × t/T)` coefficient — that was fit to a different simulation.
+3. **Bracket-rank-aware sizing — user preference: `p_model` ranking, NOT Kelly.** Within one event only one bracket wins, so the user elected to concentrate sizing on the single highest-`p_model` bracket per event. Mathematically this forgoes EV: EV per dollar notional is `(p − q)/q`, which usually favors low-p-high-edge brackets by ~10× (a 20%/10¢ bracket returns $1.00 per $1 vs 7.7¢ per $1 for a 70%/65¢ bracket). User's position is defensible under model-uncertainty shrinkage (low-p brackets have higher relative σ_p) but leaves EV on the table at high-confidence (city, lead) pairs. **Implemented as requested; code tagged with an explicit trade-off comment.** Future revisit: A/B `p_model` ranking vs `kelly × reliability` ranking once reliability index (§15.2.1) is live.
+4. **Execution hardening.** Blocks Phase 3 live-money migration. (a) Pre-entry orderbook depth check — `target_notional ≤ X% of sum(top-5 bid levels)`, currently unchecked. (b) Paper-mode slippage model — paper uses `entry_price = mid`, over-estimates real fill by spread/2 (~2–5¢ at Polymarket weather); add `effective_fill = mid + 0.5 × spread` for paper. (c) Explicit 24h volume floor — currently implicit via Gamma ordering only. (d) 429 exponential backoff on live order placement (PDF §6).
+5. **NO trades (short = buy NO).** Currently one-sided (buy YES only). Negative-edge markets (market overprices YES → buy-NO opportunity) silently dropped. Doubles the opportunity set. Structural change: `strategy.py:analyze` (two-sided edge detection), `risk.py` (side handling), `execution.py` (NO-token handling). ~1 week. Defer until §15.3.1–§15.3.4 land.
+6. **Opportunity-cost exit rule (rebalancing v2).** PDF §1 full exit rule adds `alternative_opportunity_edge ≥ 2 × current_edge`. Requires running a mini-scan of candidate signals at each rebalance tick. Not shipped in §15.1 — the landed rule is a dual-threshold hash-keyed drop (−0.15 stale / −0.10 fresh), which is a simpler surrogate that doesn't require a mini-scan. Opportunity-cost branch becomes rebalance v3; revisit after 14 days of paper data shows whether the current rule leaks EV on stale high-edge positions.
+7. **Fractional-Kelly tightening under rebalancing regime.** PDF §2 sim: rebalancing is +EV but std jumps 17× vs fixed positions. Now that §15.1 exit logic is live, revisit `kelly_fraction` (currently 0.25) — may need to drop to 0.10–0.15 to contain variance. Decide from 14-day paper equity-curve variance post-rebalance-deploy.
+8. **Live-mode sell placement.** `run_rebalance(mode="live")` currently raises `NotImplementedError` on sell-side CLOB placement — paper-only until Phase 3. Work: implement FOK sell order via `LiveExecutor`, confirm fill, write `outcome=2` only after confirmed fill. Blocks real-capital rebalancing.
+9. **Add-to-existing-position rule.** Mirror of the exit rule: when `current_edge ≥ entry_edge + Δ` on an open token (especially with fresh hash → real new info pointing even harder the same way), add incremental notional up to the per-position cap. Deferred from §15.1 to keep the first rebalance ship simple. Risk: compounds size into a thesis that could still be wrong; needs per-position-cap respect, correlation-group respect, and likely a higher `Δ` than the exit threshold to avoid whipsaw. Revisit after 14 days of paper data.
+
+---
+
+Cross-referenced files: `MUSK_SPEC.md` for tweet alpha design, `reports/profitability_analysis.html` for MC equity-curve math, `reports/weather_alpha_workflow.html` for end-to-end pipeline diagram, `tools/dashboard/README.md` for remote-monitoring setup, `polymarket handoff.pdf` for Apr 23 strategy-review source material.

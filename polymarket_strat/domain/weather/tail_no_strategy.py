@@ -438,6 +438,17 @@ def evaluate_tail_no_bracket(
             "edge_pp": edge_pp,
             "ev_per_dollar": ev_per_dollar,
             "correlation_group": group_key,
+            # Apr 26 2026 — `edge_after_fees` is the probability-pp gap
+            # (empirical_p_no - market_implied_p_no), NOT ev_per_dollar.
+            # main.py:save_trade reads meta["edge_after_fees"] into DB
+            # column entry_edge. Rebalance interprets entry_edge in
+            # probability units, so writing dollar-EV here would corrupt
+            # the rebalance threshold math (and did for the first batch
+            # of trades — see CLAUDE.md §15.x). Tail-NO trades are also
+            # skipped by rebalance via category="weather_tail_no" so this
+            # field is purely diagnostic, but keeping it in correct units
+            # avoids confusing any downstream tool that scans it.
+            "edge_after_fees": edge_pp,
         },
     )
     return plan, diag

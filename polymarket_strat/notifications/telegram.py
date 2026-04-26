@@ -211,6 +211,25 @@ class TelegramNotifier:
         lines.append(f"Session P&amp;L: {'+'if settled_pnl >= 0 else ''}${settled_pnl:,.2f}")
         lines.append(f"Cumulative P&amp;L: {'+'if cumulative_pnl >= 0 else ''}${cumulative_pnl:,.2f}")
 
+        # Rebalance summary — surfaces edge-collapse exits in the cycle
+        # roll-up even if send_exit_alert already fired a detailed message.
+        # Gives operators a single source of truth for "what happened this
+        # tick" without cross-referencing two alerts.
+        rebalance = cycle.get("rebalance") or {}
+        if rebalance:
+            ex_ct = rebalance.get("exit_count", 0)
+            ex_pnl = rebalance.get("exit_pnl_total", 0.0)
+            ho_ct = rebalance.get("hold_count", 0)
+            if ex_ct or ho_ct:
+                lines.append(
+                    f"Rebalance: <b>{ex_ct}</b> exits "
+                    f"({'+' if ex_pnl >= 0 else ''}${ex_pnl:,.2f}), "
+                    f"<b>{ho_ct}</b> holds"
+                )
+        ct_tokens = cycle.get("cooldown_token_count", 0)
+        if ct_tokens:
+            lines.append(f"Cooldown tokens: <b>{ct_tokens}</b>")
+
         # Surface strategy-layer telemetry so zero-signal cycles aren't a black
         # box.  analyze() now returns a diagnostics dict with contract counts,
         # a per-gate rejection histogram, no-forecast/no-dists contracts, and
@@ -237,6 +256,58 @@ class TelegramNotifier:
             hrrr_drops = diag.get("hrrr_dropped_city_leads") or []
             if hrrr_drops:
                 lines.append(f"HRRR/NAM dropped: {_esc(', '.join(hrrr_drops[:6]))}")
+        return self.send_message("\n".join(lines))
+
+    def send_exit_alert(
+        self,
+        *,
+        exits: list[dict[str, Any]],
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Notify about rebalance-driven position exits.
+
+        Per-exit line shows city, (truncated) question, exit reason
+        (stale / fresh-forecast), entry_edge → current_edge, and P&L.
+        Dry-run prefix makes tape-only runs visually distinct so a
+        paper-mode operator doesn't mistake them for real exits.
+        """
+        if not exits:
+            return {}
+        prefix = "[DRY-RUN] " if dry_run else ""
+        header = "REBALANCE EXIT" + ("S" if len(exits) > 1 else "")
+        lines = [
+            f"<b>{prefix}{header}</b>",
+            f"<b>{len(exits)}</b> position{'s' if len(exits) > 1 else ''} closed:",
+            "",
+        ]
+        total_pnl = 0.0
+        for ex in exits[:8]:
+            city = ex.get("city", "?")
+            question = str(ex.get("question", ""))[:40]
+            reason = ex.get("reason", "?")
+            entry_edge = float(ex.get("entry_edge", 0.0))
+            current_edge = float(ex.get("current_edge", 0.0))
+            # Apr 25 2026 BUGFIX: run_rebalance writes PnL to `exit_pnl`,
+            # not `pnl`. Previously we read `pnl` (dict key mismatch)
+            # which fell through to the 0.0 default on EVERY exit — so
+            # every telegram alert and cycle summary reported "$0.00"
+            # uniformly even when real P&L was ±$10. Try both keys for
+            # backward compat on any lingering legacy paths.
+            pnl = float(
+                ex.get("exit_pnl")
+                if ex.get("exit_pnl") is not None
+                else ex.get("pnl", 0.0)
+            )
+            total_pnl += pnl
+            sign = "+" if pnl >= 0 else ""
+            lines.append(
+                f"  {_esc(city.upper())} {_esc(question)} | {_esc(reason)} | "
+                f"edge {entry_edge:+.2%} → {current_edge:+.2%} | "
+                f"P&amp;L {sign}${pnl:,.2f}"
+            )
+        lines.append(
+            f"\n<b>Total exit P&amp;L:</b> {'+' if total_pnl >= 0 else ''}${total_pnl:,.2f}"
+        )
         return self.send_message("\n".join(lines))
 
     def send_status(self, text: str) -> dict[str, Any]:

@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-# Mac-side one-shot deploy: rsync repo + scp DB + run remote setup.
-# Idempotent — safe to re-run after code changes (skips DB copy unless --refresh-db).
+# Mac-side one-shot deploy: rsync repo + (optionally) scp DB + run remote setup.
+#
+# EC2 IS THE AUTHORITATIVE DB. Hourly autotrade cron writes trade_history on EC2;
+# daily calibration writes forecast_errors/distributions on EC2 at 04:00 KST. Mac's
+# weather.db is a development artifact. DB therefore flows ONE WAY by default —
+# NOT AT ALL. Use --refresh-db ONLY if you know Mac's DB is newer/richer than
+# EC2's (rare — typically means you've run a one-off local calibration or
+# restored from backup).
+#
+# Historical context (Apr 22→23 2026): the previous version of this script
+# size-compared the two DBs and copied Mac→EC2 whenever they differed. Of course
+# they differ — EC2 has live trades Mac doesn't. That "optimization" wiped 14
+# open positions + 9 settled trades in production. Do not reintroduce it.
 #
 # Usage:
-#   bash deploy/upload_to_ec2.sh
-#   bash deploy/upload_to_ec2.sh --refresh-db    # force re-copy weather.db
-#   bash deploy/upload_to_ec2.sh --skip-setup    # only push code, don't re-run setup
+#   bash deploy/upload_to_ec2.sh                     # code only (DB skipped)
+#   bash deploy/upload_to_ec2.sh --skip-setup        # code only, no ec2_setup.sh
+#   bash deploy/upload_to_ec2.sh --refresh-db        # ALSO copy Mac DB → EC2
+#                                                      (safety-gated by row count)
+#   bash deploy/upload_to_ec2.sh --refresh-db --force-refresh
+#                                                    # override the safety gate
 #
 set -euo pipefail
 
@@ -18,11 +32,13 @@ REPO_REMOTE="${REPO_REMOTE:-/home/ubuntu/polymarket}"
 
 REFRESH_DB=0
 SKIP_SETUP=0
+FORCE_REFRESH=0
 for arg in "$@"; do
     case "$arg" in
         --refresh-db) REFRESH_DB=1 ;;
         --skip-setup) SKIP_SETUP=1 ;;
-        --help|-h) head -10 "$0"; exit 0 ;;
+        --force-refresh) FORCE_REFRESH=1 ;;
+        --help|-h) head -24 "$0"; exit 0 ;;
         *) echo "unknown arg: $arg"; exit 1 ;;
     esac
 done
@@ -91,6 +107,14 @@ rsync -az --delete \
   --exclude 'data/weather/*.db*' \
   --exclude 'data/weather/weather_pretrim_*' \
   --exclude 'data/weather/backups' \
+  --exclude 'data/weather/quantile_models' \
+  --exclude 'data/weather/quantile_training_metrics.json' \
+  --exclude 'data/weather/climatology.json' \
+  --exclude 'data/weather/model_skill.json' \
+  --exclude 'data/weather/ece_report.json' \
+  --exclude 'data/weather/honest_ece_report.json' \
+  --exclude 'data/weather/isotonic_calibration.json' \
+  --exclude 'data/weather/reliability.json' \
   --exclude 'reports/*.html' \
   --exclude 'tools/dashboard/logs' \
   --exclude 'tools/lag_monitor/logs' \
@@ -103,28 +127,53 @@ rsync -az --delete \
   ./ "$EC2_USER@$EC2_HOST:$REPO_REMOTE/"
 echo "  code synced"
 
-# ---- 4) copy DB
+# ---- 4) copy DB (opt-in only — default SKIPs because EC2 is authoritative)
 echo
 echo "===== 4) Copy DB to EC2 ====="
-NEED_COPY=$REFRESH_DB
-if [[ $NEED_COPY -eq 0 ]]; then
-    REMOTE_SIZE=$(ssh -i "$EC2_KEY" "$EC2_USER@$EC2_HOST" \
-        "stat -c%s $REPO_REMOTE/data/weather/weather.db 2>/dev/null || echo 0")
-    LOCAL_SIZE=$(stat -f%z data/weather/weather.db 2>/dev/null || stat -c%s data/weather/weather.db)
-    if [[ "$REMOTE_SIZE" == "$LOCAL_SIZE" && "$REMOTE_SIZE" != "0" ]]; then
-        echo "  DB size matches ($LOCAL_SIZE bytes) — skipping. Use --refresh-db to force."
-    else
-        NEED_COPY=1
+if [[ $REFRESH_DB -eq 0 ]]; then
+    echo "  [skip] EC2 is the authoritative writer — not copying Mac DB."
+    echo "         Pass --refresh-db if you really need Mac → EC2. This step"
+    echo "         wiped production on Apr 22→23 2026 by size-comparing; the"
+    echo "         default is now skip-always."
+else
+    # Pre-flight safety gate: if EC2 has MORE trade_history rows than Mac,
+    # refuse to overwrite unless --force-refresh was passed. Trade rows are
+    # created only on the executor host (EC2 under current deployment), so
+    # EC2 having more trades than Mac means Mac's DB is objectively stale on
+    # the axis where wipes hurt.
+    REMOTE_TRADES=$(ssh -i "$EC2_KEY" "$EC2_USER@$EC2_HOST" \
+        "sqlite3 $REPO_REMOTE/data/weather/weather.db 'SELECT COUNT(*) FROM trade_history;' 2>/dev/null || echo 0")
+    LOCAL_TRADES=$(sqlite3 data/weather/weather.db 'SELECT COUNT(*) FROM trade_history;' 2>/dev/null || echo 0)
+    echo "  trade_history rows  Mac: $LOCAL_TRADES   EC2: $REMOTE_TRADES"
+    if [[ "$REMOTE_TRADES" -gt "$LOCAL_TRADES" && $FORCE_REFRESH -eq 0 ]]; then
+        echo
+        echo "  REFUSE: EC2 has more trade_history rows than Mac."
+        echo "  Overwriting would delete $((REMOTE_TRADES - LOCAL_TRADES)) trade row(s) from production."
+        echo "  If you're certain (e.g. recovering from backup), re-run with:"
+        echo "      bash deploy/upload_to_ec2.sh --refresh-db --force-refresh"
+        echo
+        echo "  Or, to move Mac calibration into EC2 without touching trades,"
+        echo "  export just forecast_errors + error_distributions:"
+        echo "      sqlite3 data/weather/weather.db \\"
+        echo "        \".dump forecast_errors error_distributions\" > /tmp/calib.sql"
+        echo "      scp -i $EC2_KEY /tmp/calib.sql $EC2_USER@$EC2_HOST:/tmp/"
+        echo "      ssh ... 'sqlite3 $REPO_REMOTE/data/weather/weather.db < /tmp/calib.sql'"
+        exit 1
     fi
-fi
 
-if [[ $NEED_COPY -eq 1 ]]; then
     # Clear any stale .tmp from a previous aborted deploy before scp starts —
     # otherwise scp errors can leave an old file in place that our rename then
     # promotes to be the main DB, silently deploying old bytes.
     ssh -i "$EC2_KEY" "$EC2_USER@$EC2_HOST" \
         "mkdir -p $REPO_REMOTE/data/weather && \
          rm -f $REPO_REMOTE/data/weather/weather.db.tmp"
+
+    # Also ask EC2 to stash its current DB as a safety snapshot first.
+    ssh -i "$EC2_KEY" "$EC2_USER@$EC2_HOST" \
+        "[ -f $REPO_REMOTE/data/weather/weather.db ] && \
+         cp $REPO_REMOTE/data/weather/weather.db \
+            $REPO_REMOTE/data/weather/weather.pre_deploy_\$(date +%Y%m%d_%H%M%S).db || true"
+
     scp -i "$EC2_KEY" -p \
         data/weather/weather.db \
         "$EC2_USER@$EC2_HOST:$REPO_REMOTE/data/weather/weather.db.tmp"
@@ -149,7 +198,7 @@ if [[ $NEED_COPY -eq 1 ]]; then
         echo "  refusing to continue — run deploy again with --refresh-db"
         exit 1
     fi
-    echo "  DB copied (stale WAL/SHM cleared, hash verified)"
+    echo "  DB copied (pre-deploy snapshot kept, WAL/SHM cleared, hash verified)"
 fi
 
 # ---- 5) run EC2 setup

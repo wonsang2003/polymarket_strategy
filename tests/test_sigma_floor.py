@@ -21,9 +21,11 @@ import pytest
 from polymarket_strat.domain.weather.forecast import (
     BracketProbabilityCalculator,
     _N_REAL_FORECAST_THRESHOLD,
+    _N_REAL_FORECAST_THRESHOLD_ULTRA,
     _RELAXED_FLOOR_LEADS,
     _SIGMA_FLOOR_F_REAL,
     _SIGMA_FLOOR_F_REANALYSIS,
+    _SIGMA_FLOOR_F_ULTRA,
     _effective_sigma_floor,
 )
 from polymarket_strat.domain.weather.models import (
@@ -55,16 +57,21 @@ def _dist(*, lead_hours: int, n_samples: int, sigma: float = 1.2) -> ErrorDistri
 @pytest.mark.parametrize(
     "lead_hours, n_samples, expected_floor",
     [
-        # 24h + earned samples → relaxed 2.0°F floor
+        # 24h + ULTRA samples (>=150) → 1.5°F ultra floor (Apr 24 Citadel fix #4)
+        (24, 150, _SIGMA_FLOOR_F_ULTRA),
+        (24, 500, _SIGMA_FLOOR_F_ULTRA),
+        (24, 10_000, _SIGMA_FLOOR_F_ULTRA),
+        # 24h + REAL samples (60-149) → 2.0°F real floor
         (24, 60, _SIGMA_FLOOR_F_REAL),
         (24, 91, _SIGMA_FLOOR_F_REAL),
-        (24, 1000, _SIGMA_FLOOR_F_REAL),
+        (24, 149, _SIGMA_FLOOR_F_REAL),
         # 24h but not enough samples → 2.5°F guardrail
         (24, 0, _SIGMA_FLOOR_F_REANALYSIS),
         (24, 59, _SIGMA_FLOOR_F_REANALYSIS),
         # 48h (not in relaxed set) → always 2.5°F even with plenty of samples
         (48, 60, _SIGMA_FLOOR_F_REANALYSIS),
         (48, 500, _SIGMA_FLOOR_F_REANALYSIS),
+        (48, 10_000, _SIGMA_FLOOR_F_REANALYSIS),
         # 72h and other long leads → always 2.5°F
         (72, 1000, _SIGMA_FLOOR_F_REANALYSIS),
         # 6h / 12h short-leads not in the earned set yet → 2.5°F
@@ -77,10 +84,17 @@ def test_effective_sigma_floor_table(lead_hours, n_samples, expected_floor):
     assert _effective_sigma_floor(dist) == pytest.approx(expected_floor)
 
 
-def test_constants_are_ordered():
-    """Real-era floor must be strictly smaller than the reanalysis guardrail —
-    otherwise the relaxation does nothing and the whole patch is a no-op."""
-    assert _SIGMA_FLOOR_F_REAL < _SIGMA_FLOOR_F_REANALYSIS
+def test_constants_are_strictly_ordered():
+    """Three-tier floor must be strictly monotonic: ULTRA < REAL < REANALYSIS.
+    Otherwise the tiering does nothing and the whole patch is a no-op.
+    """
+    assert _SIGMA_FLOOR_F_ULTRA < _SIGMA_FLOOR_F_REAL < _SIGMA_FLOOR_F_REANALYSIS
+
+
+def test_sample_thresholds_are_strictly_ordered():
+    """ULTRA threshold must be strictly greater than REAL threshold — the
+    tier with the most-relaxed floor must require the most evidence."""
+    assert _N_REAL_FORECAST_THRESHOLD_ULTRA > _N_REAL_FORECAST_THRESHOLD
 
 
 def test_threshold_is_conservative():

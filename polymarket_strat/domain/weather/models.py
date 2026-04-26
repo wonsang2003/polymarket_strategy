@@ -124,11 +124,21 @@ class ForecastError:
     lead_hours: int
     error_f: float               # positive = model ran hot
     obs_date: date
+    # Apr 24 2026 — season bucket (0=winter, 1=spring, 2=summer, 3=fall)
+    # derived from obs_date.month. Nullable with sentinel -1 for legacy
+    # rows; the backfill sets it from obs_date.month.
+    season: int = -1
 
 
 @dataclass(slots=True)
 class ErrorDistribution:
-    """Fitted parametric distribution for a (city, model, regime, lead) slice."""
+    """Fitted parametric distribution for a (city, model, regime, lead) slice.
+
+    Apr 24 2026 — `season` added to the slicing key. Inference derives
+    season from target_date.month and looks up the matching distribution.
+    Falls back to season=-1 (pooled) when a season-specific fit lacks
+    enough samples — see _load_dists in strategy.py.
+    """
     city: str
     model: WeatherModel
     regime: SynopticRegime
@@ -139,6 +149,7 @@ class ErrorDistribution:
     shape: float = 0.0           # skew-normal alpha, or 0 for symmetric
     nu: float = 30.0             # Student-t degrees of freedom
     n_samples: int = 0           # how many errors were used to fit
+    season: int = -1             # -1 = pooled (legacy), 0-3 = per-season
 
 
 @dataclass(slots=True)
@@ -157,6 +168,16 @@ class BracketContract:
     best_bid_yes: float = 0.0
     spread: float = 1.0
     liquidity: float = 0.0
+    # Apr 24 2026 (Citadel fix #3) — top-of-book size info for depth gate.
+    # Polymarket's Gamma `/markets` endpoint does NOT expose L2 depth,
+    # only bestBid/bestAsk prices and aggregate `liquidity`. Exact top
+    # size requires a CLOB `/book` fetch per market (expensive at scale).
+    # For the pre-entry depth gate we use `liquidity` as a proxy and set
+    # these fields when a CLOB fetch is run (e.g. inside run_rebalance).
+    # Zero values indicate "unknown" and the depth gate treats them as
+    # permissive — we fall back to the `liquidity` aggregate.
+    top_ask_size: float = 0.0    # shares available at best_ask
+    top_bid_size: float = 0.0    # shares available at best_bid
     # Multi-day contract support: end_date > target_date means multi-day
     end_date: date | None = None  # None = single-day contract
 

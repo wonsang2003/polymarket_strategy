@@ -19,16 +19,53 @@ from polymarket_strat.domain.weather.models import (
 )
 
 
+
+# -----------------------------------------------------------------------------
+# Fitter guards — motivated by the Apr 24 2026 external calibration review
+# (see CLAUDE.md §14 priority 7 and the "polymarket analysis.pdf" audit):
+#
+#   1. Skew-normal MLE frequently hits optimizer bounds on thin / ill-
+#      conditioned samples, producing garbage shape parameters like
+#      -7.5e7 or +1.2e6. These are not real fits — they are the optimizer
+#      crashing silently. Any |shape| > _MAX_SKEW_SHAPE means the fit is
+#      invalid and we should fall back to a better-conditioned family.
+#
+#   2. Three-parameter fits (skew_normal, student_t) need enough samples to
+#      be statistically meaningful. On n < 30 we get parameters dominated
+#      by noise — a 3-DoF student_t fitted to 8 samples produces σ values
+#      that are ±50% off the true σ with only 30% confidence. Force
+#      Normal(μ, σ) in that regime — it's honest and the σ at least
+#      inherits the actual sample variance rather than a fabricated fit.
+#
+# These floors are deliberately conservative. The cost of a slightly-less-
+# optimal family choice on well-sampled data is small; the cost of trading
+# on a garbage distribution is not.
+# -----------------------------------------------------------------------------
+
+# Reject skew_normal fits where |shape| exceeds this — optimizer blew up.
+_MAX_SKEW_SHAPE: float = 10.0
+
+# Below this many samples, don't fit skew_normal or student_t (3-param fits).
+# Fall back to Normal (2-param) which gracefully degrades.
+_MIN_SAMPLES_FOR_PARAMETRIC_FIT: int = 30
+
+
 class ErrorDistributionFitter:
     """Fit a parametric error distribution to forecast-minus-observed residuals.
 
-    Selection logic:
+    Selection logic (Apr 24 2026 — guarded against optimizer blow-ups and
+    small-sample garbage):
+        n < 30                                   ->  Normal (unconditional)
         |skew| < 0.3 and excess_kurtosis < 1.0  ->  Normal
-        |skew| >= 0.3                            ->  Skew-Normal
         excess_kurtosis >= 1.0                   ->  Student-t
+        |skew| >= 0.3                            ->  Skew-Normal (+ shape guard)
 
-    All fitting uses scipy MLE.  A Bayesian variant (PyMC) is provided as a
-    stub for when you want posterior-predictive bracket probabilities.
+    If the skew-normal MLE produces |shape| > _MAX_SKEW_SHAPE, the fit is
+    rejected and we fall through to Student-t (the next-best fat-tailed
+    family), or Normal if Student-t also fails.
+
+    All fitting uses scipy MLE. A Bayesian variant (PyMC) is provided
+    below for when posterior-predictive bracket probabilities are wanted.
     """
 
     def fit(
@@ -56,39 +93,95 @@ class ErrorDistributionFitter:
         from scipy import stats as sp_stats
 
         arr = np.asarray(errors, dtype=np.float64)
-        if len(arr) < 5:
-            raise ValueError(f"Need >= 5 errors to fit, got {len(arr)}")
+        n = len(arr)
+        if n < 5:
+            raise ValueError(f"Need >= 5 errors to fit, got {n}")
 
+        mu_empirical = float(np.mean(arr))
+        sigma_empirical = float(np.std(arr, ddof=1))
         skewness = float(sp_stats.skew(arr))
         excess_kurt = float(sp_stats.kurtosis(arr))  # Fisher definition (excess)
 
-        if abs(skewness) < 0.3 and excess_kurt < 1.0:
-            # Normal
-            mu, sigma = float(np.mean(arr)), float(np.std(arr, ddof=1))
+        # Guard A: below sample-size floor, don't fit 3-param families.
+        # Normal with the empirical (μ, σ) at least honestly reflects the
+        # sample; a skew_normal fit on 8 data points reflects optimizer noise.
+        if n < _MIN_SAMPLES_FOR_PARAMETRIC_FIT:
             return ErrorDistribution(
                 city=city, model=model, regime=regime, lead_hours=lead_hours,
                 family=DistributionFamily.NORMAL,
-                mu=mu, sigma=max(sigma, 1e-6), shape=0.0, nu=30.0,
-                n_samples=len(arr),
+                mu=mu_empirical, sigma=max(sigma_empirical, 1e-6),
+                shape=0.0, nu=30.0,
+                n_samples=n,
+            )
+
+        # n >= 30 — family selection by moment test.
+        if abs(skewness) < 0.3 and excess_kurt < 1.0:
+            # Normal — well-behaved, symmetric, thin-tailed
+            return ErrorDistribution(
+                city=city, model=model, regime=regime, lead_hours=lead_hours,
+                family=DistributionFamily.NORMAL,
+                mu=mu_empirical, sigma=max(sigma_empirical, 1e-6),
+                shape=0.0, nu=30.0,
+                n_samples=n,
             )
 
         if excess_kurt >= 1.0:
-            # Student-t  (fat tails)
-            df, loc, scale = sp_stats.t.fit(arr)
-            return ErrorDistribution(
-                city=city, model=model, regime=regime, lead_hours=lead_hours,
-                family=DistributionFamily.STUDENT_T,
-                mu=float(loc), sigma=float(scale), shape=0.0, nu=max(float(df), 2.01),
-                n_samples=len(arr),
-            )
+            # Student-t (fat tails)
+            try:
+                df, loc, scale = sp_stats.t.fit(arr)
+                return ErrorDistribution(
+                    city=city, model=model, regime=regime, lead_hours=lead_hours,
+                    family=DistributionFamily.STUDENT_T,
+                    mu=float(loc), sigma=float(scale), shape=0.0,
+                    nu=max(float(df), 2.01),
+                    n_samples=n,
+                )
+            except Exception:
+                # Student-t optimizer failed — fall through to Normal.
+                return ErrorDistribution(
+                    city=city, model=model, regime=regime, lead_hours=lead_hours,
+                    family=DistributionFamily.NORMAL,
+                    mu=mu_empirical, sigma=max(sigma_empirical, 1e-6),
+                    shape=0.0, nu=30.0,
+                    n_samples=n,
+                )
 
-        # Skew-Normal (asymmetric)
-        a, loc, scale = sp_stats.skewnorm.fit(arr)
+        # Skew-Normal (asymmetric) — with shape guard.
+        try:
+            a, loc, scale = sp_stats.skewnorm.fit(arr)
+        except Exception:
+            a, loc, scale = 0.0, mu_empirical, sigma_empirical
+
+        # Guard B: |shape| > 10 means the optimizer hit a boundary and failed.
+        # Real skewness in temperature errors rarely exceeds ~3 even in
+        # highly skewed regimes (marine layer burn-off, cold-air damming).
+        # A shape of 1e6 or -7e7 is pure numerical garbage.
+        if abs(float(a)) > _MAX_SKEW_SHAPE:
+            # Fall back to Student-t as next-best fat-tailed asymmetric-ish family.
+            try:
+                df, t_loc, t_scale = sp_stats.t.fit(arr)
+                return ErrorDistribution(
+                    city=city, model=model, regime=regime, lead_hours=lead_hours,
+                    family=DistributionFamily.STUDENT_T,
+                    mu=float(t_loc), sigma=float(t_scale), shape=0.0,
+                    nu=max(float(df), 2.01),
+                    n_samples=n,
+                )
+            except Exception:
+                # Last-resort Normal.
+                return ErrorDistribution(
+                    city=city, model=model, regime=regime, lead_hours=lead_hours,
+                    family=DistributionFamily.NORMAL,
+                    mu=mu_empirical, sigma=max(sigma_empirical, 1e-6),
+                    shape=0.0, nu=30.0,
+                    n_samples=n,
+                )
+
         return ErrorDistribution(
             city=city, model=model, regime=regime, lead_hours=lead_hours,
             family=DistributionFamily.SKEW_NORMAL,
             mu=float(loc), sigma=float(scale), shape=float(a), nu=30.0,
-            n_samples=len(arr),
+            n_samples=n,
         )
 
     def fit_bayesian(

@@ -8,6 +8,13 @@ dependencies = [
     "py-clob-client",
     "numpy>=1.26",
     "scipy>=1.12",
+    # Apr 24 2026 — scikit-learn for isotonic regression post-hoc calibration
+    # (scripts/fit_isotonic.py only — NOT needed at inference time; runtime
+    # uses np.interp on the serialized knots).
+    "scikit-learn>=1.3",
+    # pandas for the fit_isotonic / fit_reliability / fit_bucket_blocklist
+    # nightly scripts — CSV reads only, not critical path.
+    "pandas>=2.0",
 ]
 
 [project.optional-dependencies]

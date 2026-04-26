@@ -223,6 +223,23 @@ class WeatherMarketScanner:
             if not any(kw in lower_q for kw in _WEATHER_KEYWORDS):
                 continue
 
+            # Apr 25 2026 (LATE) — HIGHEST-temperature markets only. Our model
+            # is exclusively for daily HIGH temperature. Trading "lowest
+            # temperature" markets caused fake $7000+ wins on April 25 because
+            # the quantile model was asked "P(observed_high in [41, 42.8]°F)"
+            # for a LOW-temp bracket question. Model returned 0% (high is way
+            # above 42.8°F) → "edge" of 99.4% → $50 NO purchase at $0.0065
+            # → settlement booked as +$7489 win when in reality it was a
+            # category-error trade.
+            #
+            # Defensive triple-check: must contain "highest" (or "high temp")
+            # AND must NOT contain "lowest" (or "low temp"). The "and not"
+            # guards against ambiguous phrasings like "highest low temp."
+            if "highest" not in lower_q and "high temp" not in lower_q:
+                continue
+            if "lowest" in lower_q or "low temp" in lower_q:
+                continue
+
             city_key = self._extract_city(lower_q)
             if not city_key:
                 continue

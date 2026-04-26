@@ -38,22 +38,27 @@ def main() -> int:
     c.commit()
 
     # Find the open trades matching these market_ids, created post 2026-04-26 16:30 KST
+    # NB: trade_history.created_at is UTC. The 14 trades placed at 16:32 KST
+    # (= 07:32 UTC) and 20:07 KST (= 11:07 UTC). Match on market_id alone
+    # (these market_ids are unique to that batch) and only post the deploy
+    # cutoff in UTC. We DO NOT filter outcome IS NULL because most have
+    # already been forced-exited by rebalance (outcome=2).
     rows = cur.execute(
         """
-        SELECT id, market_id, city, side, notional, created_at,
+        SELECT id, market_id, city, side, notional, created_at, outcome,
                category, strategy_name
         FROM trade_history
         WHERE market_id IN ({})
-          AND created_at >= '2026-04-26 16:30:00'
-          AND outcome IS NULL
+          AND created_at >= '2026-04-26 07:30:00'
         """.format(",".join(["?"] * len(KNOWN_TAIL_NO_MARKETS))),
         list(KNOWN_TAIL_NO_MARKETS),
     ).fetchall()
-    print(f"matching open trades: {len(rows)}")
+    print(f"matching trades (settled or open): {len(rows)}")
     for r in rows:
-        rid, mid, city, side, notional, ts, cat, strat = r
+        rid, mid, city, side, notional, ts, outcome, cat, strat = r
+        out_label = "OPEN" if outcome is None else f"out={outcome}"
         print(f"  #{rid:>3} {ts[:16]} {city:<14} {side:<8} ${notional:>5.0f} "
-              f"market={mid} (current category={cat}, strategy={strat})")
+              f"{out_label:<8} market={mid} (category={cat}, strategy={strat})")
 
     if not rows:
         print("No matching rows. Aborting backfill.")

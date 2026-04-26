@@ -47,6 +47,15 @@ except ImportError as exc:
     )
     raise
 
+# Apr 25 2026 (LATE) — auto-refresh every 30s so live trades show up
+# without manual F5. Soft-fails to a meta-refresh tag if the package
+# isn't installed (cleaner UX than a hard ImportError).
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+    _AUTO_REFRESH_AVAILABLE = True
+except ImportError:
+    _AUTO_REFRESH_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -65,6 +74,21 @@ st.set_page_config(
     page_icon="",
     layout="wide",
 )
+
+# Auto-refresh wiring — invalidates st.cache_data and re-runs the script
+# every 30s so new trades appear without F5. The component returns a
+# count of refreshes; we don't use it but the call must happen.
+_REFRESH_INTERVAL_MS = 30_000  # 30 seconds
+if _AUTO_REFRESH_AVAILABLE:
+    st_autorefresh(interval=_REFRESH_INTERVAL_MS, key="dashboard_autorefresh")
+else:
+    # Fallback: HTML meta-refresh tag forces full page reload. Less elegant
+    # than st_autorefresh (full page reload vs targeted rerun) but works
+    # without a dependency.
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{_REFRESH_INTERVAL_MS // 1000}">',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +113,11 @@ def ro_connection(path: Path) -> sqlite3.Connection:
     return conn
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def fetch_df(_conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
+    # ttl=15 (was 60) so the 30s auto-refresh always gets fresh data.
+    # Some queries within a single rerun hit the cache; the next rerun
+    # re-fetches everything.
     return pd.read_sql_query(sql, _conn, params=params)
 
 
@@ -136,15 +163,167 @@ st.header("Open positions")
 if open_trades.empty:
     st.info("No open positions.")
 else:
+    # Join the latest market_prices row per token_id. Uses a correlated
+    # subquery to grab the MAX(fetched_at_utc) snapshot per token and
+    # left-joins so trades without a snapshot (first-tick, book fetch
+    # failure) still render — they just have blank MTM columns.
+    mtm_sql = """
+        SELECT
+            t.id, t.token_id, t.city, t.target_date, t.question, t.side,
+            t.entry_price, t.notional, t.model_prob, t.market_prob, t.edge,
+            t.entry_edge, t.mode, t.created_at,
+            mp.best_bid  AS current_price,
+            mp.best_ask,
+            mp.mid_price,
+            mp.fetched_at_utc
+        FROM trade_history t
+        LEFT JOIN (
+            SELECT mp1.*
+            FROM market_prices mp1
+            JOIN (
+                SELECT token_id, MAX(fetched_at_utc) AS mx
+                FROM market_prices
+                GROUP BY token_id
+            ) latest
+              ON latest.token_id = mp1.token_id
+             AND latest.mx = mp1.fetched_at_utc
+        ) mp ON mp.token_id = t.token_id
+        WHERE t.outcome IS NULL
+        ORDER BY t.created_at DESC
+    """
+    try:
+        open_mtm = fetch_df(conn, mtm_sql)
+    except Exception as exc:
+        # market_prices table didn't exist on pre-Apr-24 DBs — fall back
+        # to the plain open-positions view so the dashboard still loads
+        # on legacy copies.
+        st.warning(f"MTM join failed ({exc}); showing legacy view.")
+        open_mtm = open_trades.copy()
+        for col in ("current_price", "best_ask", "mid_price", "fetched_at_utc", "entry_edge"):
+            if col not in open_mtm.columns:
+                open_mtm[col] = None
+
+    # Compute shares, MTM, unrealized P&L. Uses best_bid as current_price
+    # (the conservative "could-I-exit-now" mark), matching the paper-exit
+    # formula in run_rebalance. Fee applies only to gains.
+    def _shares_safe(row):
+        ep = row.get("entry_price") or 0
+        nt = row.get("notional") or 0
+        return (nt / ep) if ep > 0 else 0.0
+
+    def _mtm_value(row):
+        cp = row.get("current_price")
+        if cp is None or pd.isna(cp):
+            return None
+        return _shares_safe(row) * float(cp)
+
+    def _unrealized_pnl(row):
+        cp = row.get("current_price")
+        if cp is None or pd.isna(cp):
+            return None
+        shares = _shares_safe(row)
+        ep = float(row.get("entry_price") or 0)
+        gross = shares * (float(cp) - ep)
+        fee = 0.02 * gross if gross > 0 else 0.0
+        return gross - fee
+
+    def _pnl_pct(row):
+        pnl = _unrealized_pnl(row)
+        if pnl is None:
+            return None
+        nt = float(row.get("notional") or 0)
+        if nt <= 0:
+            return None
+        return pnl / nt
+
+    def _last_updated_local(row):
+        fetched = row.get("fetched_at_utc")
+        city = row.get("city")
+        if not fetched or pd.isna(fetched) or not city:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+            from polymarket_strat.domain.weather.models import CITY_REGISTRY
+            station = CITY_REGISTRY.get(city)
+            if not station or not getattr(station, "timezone", None):
+                return str(fetched)
+            dt = datetime.fromisoformat(str(fetched).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                from datetime import timezone as _tz
+                dt = dt.replace(tzinfo=_tz.utc)
+            local = dt.astimezone(ZoneInfo(station.timezone))
+            return local.strftime("%Y-%m-%d %H:%M %Z")
+        except Exception:
+            return str(fetched) if fetched is not None else None
+
+    open_mtm["mtm_value"] = open_mtm.apply(_mtm_value, axis=1)
+    open_mtm["unrealized_pnl"] = open_mtm.apply(_unrealized_pnl, axis=1)
+    open_mtm["pnl_pct"] = open_mtm.apply(_pnl_pct, axis=1)
+    open_mtm["last_updated_local"] = open_mtm.apply(_last_updated_local, axis=1)
+
     display_cols = [
-        "city", "target_date", "question", "side", "entry_price",
-        "notional", "model_prob", "market_prob", "edge", "mode", "created_at",
+        "city", "target_date", "question", "side",
+        "entry_price", "current_price", "notional", "mtm_value",
+        "unrealized_pnl", "pnl_pct",
+        "model_prob", "market_prob", "edge", "entry_edge",
+        "mode", "last_updated_local",
     ]
-    st.dataframe(
-        open_trades[[c for c in display_cols if c in open_trades.columns]],
-        use_container_width=True,
-        hide_index=True,
+    present = [c for c in display_cols if c in open_mtm.columns]
+    view = open_mtm[present].copy()
+
+    # Styler for coloring unrealized P&L (green positive / red negative /
+    # grey None). `map` avoids the deprecated applymap path.
+    def _color_pnl(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "color: #888"
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if v > 0:
+            return "color: #1a7f37; font-weight: 600"
+        if v < 0:
+            return "color: #cf222e; font-weight: 600"
+        return ""
+
+    fmt: dict[str, str] = {}
+    if "entry_price" in view.columns: fmt["entry_price"] = "{:.3f}"
+    if "current_price" in view.columns: fmt["current_price"] = "{:.3f}"
+    if "notional" in view.columns: fmt["notional"] = "${:,.2f}"
+    if "mtm_value" in view.columns: fmt["mtm_value"] = "${:,.2f}"
+    if "unrealized_pnl" in view.columns: fmt["unrealized_pnl"] = "${:+,.2f}"
+    if "pnl_pct" in view.columns: fmt["pnl_pct"] = "{:+.2%}"
+    if "model_prob" in view.columns: fmt["model_prob"] = "{:.2%}"
+    if "market_prob" in view.columns: fmt["market_prob"] = "{:.2%}"
+    if "edge" in view.columns: fmt["edge"] = "{:+.2%}"
+    if "entry_edge" in view.columns: fmt["entry_edge"] = "{:+.2%}"
+
+    styled = view.style.format(fmt, na_rep="—")
+    if "unrealized_pnl" in view.columns:
+        styled = styled.map(_color_pnl, subset=["unrealized_pnl"])
+    if "pnl_pct" in view.columns:
+        styled = styled.map(_color_pnl, subset=["pnl_pct"])
+
+    st.dataframe(styled, hide_index=True)
+
+    # Summary row: sum of MTM, unrealized P&L, position count
+    mtm_sum = float(open_mtm["mtm_value"].dropna().sum())
+    upnl_sum = float(open_mtm["unrealized_pnl"].dropna().sum())
+    priced_ct = int(open_mtm["current_price"].notna().sum())
+    total_ct = len(open_mtm)
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Open MTM value $", f"{mtm_sum:,.2f}")
+    s2.metric(
+        "Unrealized P&L $",
+        f"{upnl_sum:+,.2f}",
+        delta_color=("normal" if upnl_sum >= 0 else "inverse"),
     )
+    s3.metric("Priced / total", f"{priced_ct} / {total_ct}")
+    if priced_ct < total_ct:
+        st.caption(
+            f"{total_ct - priced_ct} position(s) have no price snapshot yet. "
+            "run autotrade (or `rebalance --dry-run`) to populate."
+        )
 
 # ---------------------------------------------------------------------------
 # Equity curve
@@ -185,7 +364,6 @@ if not settled.empty:
     ]
     st.dataframe(
         settled[[c for c in show_cols if c in settled.columns]].head(50),
-        use_container_width=True,
         hide_index=True,
     )
 
@@ -205,7 +383,7 @@ if dists.empty:
 else:
     col_a, col_b = st.columns([2, 1])
     with col_a:
-        st.dataframe(dists, use_container_width=True, hide_index=True)
+        st.dataframe(dists, hide_index=True)
     with col_b:
         # Flag outliers: |mu| > 5 or sigma > 5 — these are the distributions
         # strategy.py filters out at inference
@@ -215,7 +393,7 @@ else:
         else:
             st.warning(f"{len(bad)} distribution(s) flagged as outliers — excluded at inference.")
             st.dataframe(bad[["city", "model", "lead_hours", "mu", "sigma", "n_samples"]],
-                         use_container_width=True, hide_index=True)
+                         hide_index=True)
 
     st.caption(
         "σ_floor = 2.5°F (see CLAUDE.md §5.2). Distributions with σ below the "
@@ -271,10 +449,10 @@ if LAG_EVENTS.exists():
             summary.columns = ["event", "count"]
             c_l, c_r = st.columns([1, 2])
             with c_l:
-                st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.dataframe(summary, hide_index=True)
             with c_r:
                 st.caption(f"Last 500 of {len(rows)} events from {LAG_EVENTS.name}")
-                st.dataframe(lag_df.tail(50), use_container_width=True, hide_index=True)
+                st.dataframe(lag_df.tail(50), width="stretch", hide_index=True)
     except Exception as exc:
         st.warning(f"Could not parse lag events: {exc}")
 
@@ -294,7 +472,7 @@ if WALKFWD_CSV.exists():
                           base_rate=("outcome", "mean"),
                           mean_pred=("predicted_prob", "mean"))
                      .reset_index())
-            st.dataframe(agg, use_container_width=True, hide_index=True)
+            st.dataframe(agg, width="stretch", hide_index=True)
     except Exception as exc:
         st.warning(f"Could not load walk-forward CSV: {exc}")
 
