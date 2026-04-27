@@ -167,10 +167,17 @@ def _ago(ts) -> str:
 
 
 def _ago_from_mtime(path: Path) -> str:
-    """File mtime → human-readable 'ago'. Returns '—' if the path doesn't exist."""
-    if not path.exists():
-        return "—"
+    """File mtime → human-readable 'ago'. Returns '—' on any failure.
+
+    Catches PermissionError, FileNotFoundError, and any other os-level
+    fault. `path.exists()` itself raises PermissionError when the parent
+    directory is unreadable (sandboxed envs, dashboards running under a
+    different uid than the log writer), so the *whole* probe needs to be
+    behind try/except — not just the stat call.
+    """
     try:
+        if not path.exists():
+            return "—"
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         delta_s = (_now_utc - mtime).total_seconds()
         if delta_s < 60:
