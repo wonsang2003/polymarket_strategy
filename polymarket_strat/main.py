@@ -438,6 +438,22 @@ _REBALANCE_COOLDOWN_HOURS = 3            # Apr 24 2026 (fix #9): was 6h,
                                          # longer restricted by forecast-run
                                          # cadence.
 
+# Apr 28 2026 — Catastrophic-flip emergency exit override for tail-NO trades.
+# Tail-NO is normally buy-and-hold (skip-listed in rebalance). This override
+# forces an exit when:
+#   1. The current best_bid for the NO token is < 0.10 (market thinks NO has
+#      < 10% chance of paying — i.e., bracket is near-certain to hit YES), AND
+#   2. Current paper-mode unrealized P&L is < -30% of notional (we're already
+#      deep underwater so the exit-vs-hold tradeoff is between guaranteed
+#      full-notional loss and locking in whatever recovery value bid offers).
+#
+# Without this override we'd hold positions like Munich #189 (entry 0.59,
+# bid 0.003 = market 99.7% certain bracket will hit) all the way to a
+# guaranteed -$40 settlement loss. Exiting at 0.003 still loses $39.78 but
+# the rule pays for itself on cases where bid > 0.05 and recovery > $5.
+_CATASTROPHIC_BID_CEILING = 0.10
+_CATASTROPHIC_UPNL_FRACTION = 0.30
+
 
 def _breakeven_current_model_prob(
     *,
@@ -915,12 +931,90 @@ def run_rebalance(
         # natural settlement. The empirical hit rate analysis was conditioned
         # on bracket geometry NOT changing, so partial-hold reduces the
         # statistical guarantees.
+        #
+        # Apr 28 2026 — EXCEPT for catastrophic-flip cases. If the market
+        # has near-fully flipped against us (bid < 0.10 = NO has < 10%
+        # implied probability) AND we're at -30%+ unrealized, exit instead
+        # of locking in a guaranteed full-notional loss. See constants
+        # _CATASTROPHIC_BID_CEILING / _CATASTROPHIC_UPNL_FRACTION above.
         if category == "weather_tail_no":
-            skipped.append({
+            catastrophic = False
+            cat_bid: float | None = None
+            cat_upnl: float | None = None
+            if (
+                mode == "paper"
+                and entry_price > 0
+                and notional > 0
+                and token_id
+            ):
+                try:
+                    cat_book = client.get_orderbook(token_id)
+                    cat_bid = _best_price_from_book(
+                        cat_book, side="bids", take_min=False,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[rebalance] {city} #{pos['id']} catastrophic-check "
+                        f"orderbook fetch failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    cat_bid = None
+                if cat_bid is not None and cat_bid < _CATASTROPHIC_BID_CEILING:
+                    cat_shares = notional / entry_price
+                    cat_gross = cat_shares * (cat_bid - entry_price)
+                    # Loss case → no fee (fee on winnings only). Gain case
+                    # would never trigger here because bid < 0.10 < entry.
+                    cat_upnl = cat_gross
+                    if cat_upnl < -_CATASTROPHIC_UPNL_FRACTION * notional:
+                        catastrophic = True
+
+            if not catastrophic:
+                skipped.append({
+                    "id": pos["id"],
+                    "city": city,
+                    "reason": "tail_no_hold_to_settlement",
+                })
+                continue
+
+            # Catastrophic-flip exit. Mirror the standard exit-recording
+            # path so dashboard / telegram / cooldown all behave correctly.
+            assert cat_bid is not None and cat_upnl is not None
+            cat_shares = notional / entry_price
+            print(
+                f"[rebalance] {city} #{pos['id']} CATASTROPHIC FLIP "
+                f"(bid={cat_bid:.3f}, upnl=${cat_upnl:+.2f}, "
+                f"entry={entry_price:.3f}). Overriding tail-NO skip-list.",
+                file=sys.stderr,
+            )
+            cat_record = {
                 "id": pos["id"],
                 "city": city,
-                "reason": "tail_no_hold_to_settlement",
-            })
+                "token_id": token_id,
+                "category": category,
+                "entry_edge": (
+                    round(float(entry_edge), 4) if entry_edge is not None else None
+                ),
+                "entry_price": round(entry_price, 4),
+                "notional": notional,
+                "best_bid": round(cat_bid, 4),
+                "shares": round(cat_shares, 4),
+                "exit_pnl": round(cat_upnl, 4),
+                "reason": "catastrophic_flip",
+            }
+            if not dry_run:
+                db.close_position_as_exit(
+                    pos["id"],
+                    pnl=round(cat_upnl, 4),
+                    exit_price=cat_bid,
+                    settled_at=now_iso,
+                    exit_reason="catastrophic_flip",
+                )
+                db.insert_cooldown(
+                    token_id=token_id,
+                    closed_at=now_iso,
+                    cooldown_until=cooldown_until,
+                )
+            exits.append(cat_record)
             continue
 
         # Legacy rows pre-dating the entry_edge column can't be rebalanced

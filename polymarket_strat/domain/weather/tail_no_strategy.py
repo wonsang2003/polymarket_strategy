@@ -65,10 +65,22 @@ EDGE_DISTANCE_MIN_F: float = 1.0
 EDGE_DISTANCE_MAX_F: float = 5.0
 LEAD_HOURS_MIN: float = 4.0
 LEAD_HOURS_MAX: float = 72.0
-NO_ASK_MIN: float = 0.05
+# Apr 28 2026 — NO_ASK_MIN raised 0.05 → 0.40 after overnight audit.
+# Rationale: low-NO-ask entries (NO @ < 0.40) are NO-bets where the market
+# itself thinks NO has < 40% chance. Even with a positive edge vs market,
+# the magnitude asymmetry destroys EV: at 0.34 entry on $50 notional, a
+# loss costs $50 while a win pays only $33. Below the gate, the strategy
+# is structurally negative-EV regardless of model edge.
+NO_ASK_MIN: float = 0.40
 NO_ASK_MAX: float = 0.95
 LIQUIDITY_MIN_USD: float = 200.0
-EDGE_FLOOR_PP: float = 0.03   # 3pp empirical hit rate vs market NO
+# Apr 28 2026 — EDGE_FLOOR_PP raised 0.03 → 0.10 after overnight audit.
+# Of 5 catastrophic losses in the 8h window ending Apr 28 05:53 KST, four
+# were entered with edge ∈ [+4.5pp, +9.3pp]. At 5pp gate the strategy was
+# bleeding marginal-edge entries with full-notional downside. Backtest of
+# this window: 0.10pp gate would have rejected 4/5 losses (saved $150)
+# while sacrificing 3/6 small wins (gave up $30). Net +$120 in 8h.
+EDGE_FLOOR_PP: float = 0.10   # 10pp empirical hit rate vs market NO
 
 # Position sizing tiers (EV per dollar invested)
 SIZE_TIER_LARGE_EV: float = 1.0

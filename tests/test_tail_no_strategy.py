@@ -34,10 +34,14 @@ def test_constants_match_design_decisions() -> None:
     assert tns.EDGE_DISTANCE_MAX_F == 5.0
     assert tns.LEAD_HOURS_MIN == 4.0
     assert tns.LEAD_HOURS_MAX == 72.0
-    assert tns.NO_ASK_MIN == 0.05
+    # Apr 28 2026 — both bumped after overnight audit showed marginal-edge
+    # entries (4.5-9.3pp) and low-NO-ask entries (0.34) accounted for 4 of
+    # 5 catastrophic full-notional losses in a single 8h window. See
+    # comments in tail_no_strategy.py for the historical thresholds.
+    assert tns.NO_ASK_MIN == 0.40
     assert tns.NO_ASK_MAX == 0.95
     assert tns.LIQUIDITY_MIN_USD == 200.0
-    assert tns.EDGE_FLOOR_PP == 0.03
+    assert tns.EDGE_FLOOR_PP == 0.10
     assert tns.POSITION_SIZE_LARGE_USD == 50.0
     assert tns.POSITION_SIZE_MEDIUM_USD == 40.0
     assert tns.POSITION_SIZE_BASE_USD == 30.0
