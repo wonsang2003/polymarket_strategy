@@ -12,6 +12,14 @@ TZ=Asia/Seoul
 # Phase 1 paper: hourly is conservative. Bump to */30 once calibration matures.
 0 * * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat autotrade >> /home/ubuntu/polymarket/logs/autotrade.log 2>&1
 
+# Apr 27 2026 — MTM-only price snapshot every 5 minutes. Independent of
+# the hourly autotrade cycle (no settle/rebalance/analyze). Updates the
+# market_prices table so the dashboard's unrealised-P&L panel reflects
+# fresh CLOB prices between hourly ticks. ~18 orderbook fetches per run
+# at current open-position count. The :02 minute offset stays clear of
+# the :00 hourly autotrade tick.
+2,7,12,17,22,27,32,37,42,47,52,57 * * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat snap-mtm >> /home/ubuntu/polymarket/logs/snap_mtm.log 2>&1
+
 # Daily calibration refresh at 04:00 KST (off-peak, after EU close)
 0 4 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/polymarket-strat weather-calibrate >> /home/ubuntu/polymarket/logs/calibrate.log 2>&1
 

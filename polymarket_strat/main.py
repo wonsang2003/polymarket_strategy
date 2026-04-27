@@ -492,6 +492,41 @@ def _breakeven_current_model_prob(
     return numerator / denominator
 
 
+def _resolve_token_side(pos: dict[str, Any]) -> str:
+    """Smart-fallback for the token_side of a stored position.
+
+    Apr 27 2026 — replaces the previous `pos.get("token_side") or "YES"`
+    pattern which silently coerced any NULL token_side to YES, mis-routing
+    NO-side trades through YES-side edge math in run_rebalance.
+
+    Resolution rules (in priority order):
+      1. If `side` contains "NO" (e.g. "BUY_NO", "NO"), return "NO".
+      2. Else if `side` contains "YES" (e.g. "BUY_YES"), return "YES".
+         (1) and (2) are STRONG sources of truth — the strategy that
+         created the trade explicitly named the side. Any stored
+         token_side column that disagrees is treated as stale.
+      3. Else (no side info), return stored `token_side` if non-empty.
+      4. Else, fall back to "YES" (legacy default for pre-fix-#5 rows).
+
+    Why side-first: a trade with side="BUY_NO" is unambiguously a NO bet
+    regardless of any stale or missing token_side. Even if a future
+    strategy regresses on persisting token_side, this derivation keeps
+    rebalance math correct.
+
+    Edge case — side strings that contain neither "NO" nor "YES" (e.g.
+    legacy "BUY"): fall through to the stored token_side column.
+
+    Returns:
+        "YES" or "NO".
+    """
+    side_str = str(pos.get("side") or "").upper()
+    if "NO" in side_str:
+        return "NO"
+    if "YES" in side_str:
+        return "YES"
+    return str(pos.get("token_side") or "YES")
+
+
 def _compute_current_edge(
     *,
     model_prob: float,
@@ -740,6 +775,62 @@ def _run_tail_no_strategy_pass(
         cooldown_token_ids=cooldown,
     )
     return result.trade_plan, result.diagnostics
+
+
+def run_snap_mtm(*, env_file: str = ".env") -> dict[str, Any]:
+    """Lightweight market-prices snapshot only.
+
+    Apr 27 2026 — designed to run on a fast cron (e.g. every 5 minutes)
+    independent of the full hourly autotrade cycle. Writes one
+    `market_prices` row per currently-open position so the dashboard's
+    MTM panel stays fresh between hourly settle/rebalance ticks.
+
+    Does NOT run settlement, rebalance, or signal analysis — those stay
+    on the hourly cron. This is just price refresh.
+
+    Returns:
+        {"snapshot_count": int, "open_positions": int, "duration_s": float}
+    """
+    import sys
+    import time as _time
+
+    from polymarket_strat.api import PolymarketPublicClient
+    from polymarket_strat.infrastructure.weather.persistence import (
+        WeatherDatabase,
+    )
+
+    load_env_file(env_file)
+    t0 = _time.time()
+    db = WeatherDatabase()
+    client = PolymarketPublicClient()
+
+    open_positions = db.get_open_positions()
+    n_open = len(open_positions)
+    if n_open == 0:
+        db.close()
+        result = {"snapshot_count": 0, "open_positions": 0,
+                  "duration_s": round(_time.time() - t0, 3)}
+        print(f"[snap-mtm] no open positions; nothing to snapshot.",
+              file=sys.stderr)
+        return result
+
+    print(f"[snap-mtm] snapshotting {n_open} open positions...",
+          file=sys.stderr)
+    try:
+        snapshot_count = _snapshot_open_position_prices(db, client)
+    except Exception as exc:
+        print(f"[snap-mtm] errored: {exc}", file=sys.stderr)
+        snapshot_count = 0
+    db.close()
+
+    duration = round(_time.time() - t0, 3)
+    print(f"[snap-mtm] wrote {snapshot_count} rows in {duration}s",
+          file=sys.stderr)
+    return {
+        "snapshot_count": snapshot_count,
+        "open_positions": n_open,
+        "duration_s": duration,
+    }
 
 
 def run_rebalance(
@@ -1027,7 +1118,14 @@ def run_rebalance(
         #     model_prob_no = 1 - model_prob_yes
         #     best_ask_no   = already in `best_ask` (it's the NO-token ask)
         # Same formula applies with flipped model_prob.
-        token_side = str(pos.get("token_side") or "YES")
+        #
+        # Apr 27 2026 — smart-fallback hardening via _resolve_token_side.
+        # Previously read `str(pos.get("token_side") or "YES")` which
+        # silently mis-routed any NULL row through YES-side math. The
+        # helper prefers the side column ("BUY_NO" → NO) so a future
+        # strategy that regresses on persisting token_side can't break
+        # rebalance math.
+        token_side = _resolve_token_side(pos)
         edge_model_prob = (1.0 - model_prob) if token_side == "NO" else model_prob
 
         # Mark the exit at best_ask (conservative: could we re-enter?).
@@ -2166,6 +2264,18 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--confirm-live", action="store_true", help="Required safety flag for live execution.")
     auto.add_argument("--max-open", type=int, default=30, help="Max open positions before skipping execution.")
 
+    # Apr 27 2026 — dedicated MTM-only snapshot for high-cadence cron
+    # ("*/5 * * * *"). Doesn't trigger settle/rebalance/analyze; only
+    # writes market_prices rows so the dashboard's unrealised P&L stays
+    # fresh between hourly autotrade ticks.
+    subparsers.add_parser(
+        "snap-mtm",
+        help=(
+            "Snapshot orderbook prices for all open positions. Lightweight; "
+            "designed for */5min cron. Independent of settle/rebalance."
+        ),
+    )
+
     rebal = subparsers.add_parser(
         "rebalance",
         help=(
@@ -2271,6 +2381,10 @@ def main() -> None:
             env_file=args.env_file,
             dry_run=args.dry_run,
         )
+        _print_json(result)
+        return
+    if args.command == "snap-mtm":
+        result = run_snap_mtm(env_file=args.env_file)
         _print_json(result)
         return
     parser.error(f"Unsupported command: {args.command}")
