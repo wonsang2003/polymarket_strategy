@@ -34,14 +34,24 @@ def test_constants_match_design_decisions() -> None:
     assert tns.EDGE_DISTANCE_MAX_F == 5.0
     assert tns.LEAD_HOURS_MIN == 4.0
     assert tns.LEAD_HOURS_MAX == 72.0
-    # Apr 28 2026 — both bumped after overnight audit showed marginal-edge
-    # entries (4.5-9.3pp) and low-NO-ask entries (0.34) accounted for 4 of
-    # 5 catastrophic full-notional losses in a single 8h window. See
-    # comments in tail_no_strategy.py for the historical thresholds.
-    assert tns.NO_ASK_MIN == 0.40
+    # Apr 28 2026 (afternoon) — REVERTED to original 0.05 / 0.03 after
+    # the 36h triple-check audit revealed the morning's tightening was
+    # built on selection bias from an unrepresentative 8h losing streak.
+    # Counterfactual showed the tighter gates would have cost $130 of
+    # realized P&L on the same 36h window. The replacement filter is
+    # the wide-bracket low-NO-ask gate below.
+    assert tns.NO_ASK_MIN == 0.05
     assert tns.NO_ASK_MAX == 0.95
     assert tns.LIQUIDITY_MIN_USD == 200.0
-    assert tns.EDGE_FLOOR_PP == 0.10
+    assert tns.EDGE_FLOOR_PP == 0.03
+    # Apr 28 2026 (afternoon) — wide-bracket low-NO-ask gate. Pins:
+    #   width > 10°F (sentinel value indicates one-sided bracket)
+    #   AND no_ask < 0.50 → reject
+    # Lifetime evidence: 15 wide-NO trades, net −$217.27, both outright
+    # settle losses (#83 seoul entry 0.19, #187 milan entry 0.34) at
+    # NO entry < 0.40.
+    assert tns.WIDE_BRACKET_F == 10.0
+    assert tns.WIDE_BRACKET_MIN_NO_ASK == 0.50
     assert tns.POSITION_SIZE_LARGE_USD == 50.0
     assert tns.POSITION_SIZE_MEDIUM_USD == 40.0
     assert tns.POSITION_SIZE_BASE_USD == 30.0
@@ -263,6 +273,53 @@ class TestEvaluateGates:
         )
         assert plan is None
         assert "edge_below_floor" in diag.reject_reason
+
+    def test_rejects_wide_bracket_low_no_ask(self) -> None:
+        """Apr 28 2026 PM: wide one-sided brackets at low NO ask reject.
+
+        Pattern from lifetime data: 15 wide-NO trades net −$217.27 with
+        the two outright settle losses (#83 seoul entry 0.19, #187 milan
+        entry 0.34) at NO entry < 0.40. Width=121.2°F (one-sided "26°C or
+        higher" sentinel) + best_bid_yes=0.65 (no_ask=0.35 < 0.50) → reject.
+
+        Forecast=75°F is 3.8°F BELOW bracket lower=78.8°F (=26°C), so this
+        is a valid ABOVE-direction tail-NO setup that would otherwise
+        pass gates 1-3 before hitting the new wide-bracket gate at 4b.
+        """
+        ct = _stub_contract(
+            lower_f=78.8, upper_f=200.0,  # one-sided "26°C or higher"
+            best_bid_yes=0.65,             # no_ask = 0.35 (low)
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=75.0,  # 3.8°F below bracket
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is None
+        assert "wide_bracket_low_no_ask" in diag.reject_reason
+
+    def test_passes_wide_bracket_high_no_ask(self) -> None:
+        """Wide bracket with HIGH NO ask is fine — confidence supports the bet.
+
+        Lifetime evidence: the one wide-bracket NO win (#200 buenos_aires)
+        was at entry 0.82. Wide brackets aren't broken; the asymmetric
+        downside is only a problem at low NO entry. With no_ask=0.85 the
+        wide-bracket gate should NOT fire.
+        """
+        ct = _stub_contract(
+            lower_f=64.4, upper_f=200.0,   # one-sided "18°C or higher"
+            best_bid_yes=0.15,              # no_ask = 0.85 (high)
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=61.0,  # 3.4°F below bracket
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        # Should NOT reject for wide-bracket reason — may reject for
+        # other reasons (e.g. edge too low) but not this one.
+        assert "wide_bracket_low_no_ask" not in diag.reject_reason
 
     def test_rejects_low_liquidity(self) -> None:
         ct = _stub_contract(

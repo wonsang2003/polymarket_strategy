@@ -65,22 +65,38 @@ EDGE_DISTANCE_MIN_F: float = 1.0
 EDGE_DISTANCE_MAX_F: float = 5.0
 LEAD_HOURS_MIN: float = 4.0
 LEAD_HOURS_MAX: float = 72.0
-# Apr 28 2026 — NO_ASK_MIN raised 0.05 → 0.40 after overnight audit.
-# Rationale: low-NO-ask entries (NO @ < 0.40) are NO-bets where the market
-# itself thinks NO has < 40% chance. Even with a positive edge vs market,
-# the magnitude asymmetry destroys EV: at 0.34 entry on $50 notional, a
-# loss costs $50 while a win pays only $33. Below the gate, the strategy
-# is structurally negative-EV regardless of model edge.
-NO_ASK_MIN: float = 0.40
+# Apr 28 2026 (afternoon) — REVERTED from 0.40 back to 0.05 after the 36h
+# triple-check audit showed selection bias in the morning's tightening.
+# Counterfactual on the full 36h window: 0.40 gate would have cost $130
+# of realized P&L vs the actual current 0.05 setting. The morning audit
+# was based on an unrepresentative 8h losing streak.
+NO_ASK_MIN: float = 0.05
 NO_ASK_MAX: float = 0.95
 LIQUIDITY_MIN_USD: float = 200.0
-# Apr 28 2026 — EDGE_FLOOR_PP raised 0.03 → 0.10 after overnight audit.
-# Of 5 catastrophic losses in the 8h window ending Apr 28 05:53 KST, four
-# were entered with edge ∈ [+4.5pp, +9.3pp]. At 5pp gate the strategy was
-# bleeding marginal-edge entries with full-notional downside. Backtest of
-# this window: 0.10pp gate would have rejected 4/5 losses (saved $150)
-# while sacrificing 3/6 small wins (gave up $30). Net +$120 in 8h.
-EDGE_FLOOR_PP: float = 0.10   # 10pp empirical hit rate vs market NO
+# Apr 28 2026 (afternoon) — REVERTED from 0.10 back to 0.03 for the same
+# reason. The 5pp gate is correctly calibrated: directional NO trades
+# in the 36h window had +$8.05 expectancy (77.3% win rate) at this gate.
+# Tightening to 0.10 would have kept only 5 of 22 trades and reduced
+# realized P&L from $177 to $132. The 22-trade sample at 0.05 is genuine
+# alpha; tightening filters out the volume that gives statistical reliability.
+EDGE_FLOOR_PP: float = 0.03   # 3pp empirical hit rate vs market NO
+
+# Apr 28 2026 (afternoon) — Wide-bracket low-NO-ask gate.
+# One-sided brackets ("X or higher" / "X or below") parse with a sentinel
+# upper or lower bound (e.g. bracket_upper_f=200°F for "≥ X" questions).
+# Width > 10°F flags such brackets. Lifetime data on these trades:
+#   15 wide-NO trades total
+#    1 win (+$6.45)         entry 0.82
+#    2 outright losses (−$100) entries 0.19, 0.34
+#   12 rebalance exits (−$123)
+#   net P&L: −$217.27
+# The losses concentrate at low NO entry prices — we're betting the
+# bracket WON'T hit when the market thinks YES is highly likely (NO ≪
+# 0.50). On a one-sided bracket with no upper containment, a marginal
+# weather move can flip the outcome to full-notional loss.
+# Filter: reject NO entry on wide-bracket contracts unless NO_ASK ≥ 0.50.
+WIDE_BRACKET_F: float = 10.0       # bracket width threshold
+WIDE_BRACKET_MIN_NO_ASK: float = 0.50  # min NO ask for wide-bracket entry
 
 # Position sizing tiers (EV per dollar invested)
 SIZE_TIER_LARGE_EV: float = 1.0
@@ -342,6 +358,23 @@ def evaluate_tail_no_bracket(
         return None, diag
     if no_ask > NO_ASK_MAX:
         diag.reject_reason = f"no_ask_too_high ({no_ask:.4f})"
+        return None, diag
+
+    # Gate 4b (Apr 28 2026 PM): wide-bracket low-NO-ask reject.
+    # Wide brackets (width > 10°F) are one-sided "X or higher" / "X or
+    # below" contracts where one bracket bound is a sentinel value. At
+    # NO ask < 0.50 the market thinks YES is likely; the loss-magnitude
+    # asymmetry on a one-sided bracket (no upper containment) means a
+    # single-degree weather miss is full notional. Lifetime n=15 wide-NO
+    # trades net −$217.27, with the two outright settle losses both at
+    # NO entry < 0.40. Filter resolves the dominant loss pattern without
+    # affecting normal 1°C contracts (width ≈ 1.8°F).
+    bracket_width_f = abs(float(contract.upper_f) - float(contract.lower_f))
+    if bracket_width_f > WIDE_BRACKET_F and no_ask < WIDE_BRACKET_MIN_NO_ASK:
+        diag.reject_reason = (
+            f"wide_bracket_low_no_ask "
+            f"(width={bracket_width_f:.1f}F, no_ask={no_ask:.3f})"
+        )
         return None, diag
 
     # Gate 5: liquidity
