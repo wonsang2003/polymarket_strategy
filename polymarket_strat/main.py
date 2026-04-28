@@ -937,7 +937,12 @@ def run_rebalance(
         # implied probability) AND we're at -30%+ unrealized, exit instead
         # of locking in a guaranteed full-notional loss. See constants
         # _CATASTROPHIC_BID_CEILING / _CATASTROPHIC_UPNL_FRACTION above.
-        if category == "weather_tail_no":
+        #
+        # Apr 28 2026 PM — also skip-list "weather_tail_no_flipped" (the
+        # subset NO->YES experiment). Same buy-and-hold treatment so the
+        # A/B comparison is clean: both groups settle naturally vs the
+        # rebalance rule. Catastrophic-flip override applies to both.
+        if category in ("weather_tail_no", "weather_tail_no_flipped"):
             catastrophic = False
             cat_bid: float | None = None
             cat_upnl: float | None = None

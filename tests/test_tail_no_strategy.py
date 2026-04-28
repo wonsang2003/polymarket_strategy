@@ -203,11 +203,11 @@ class TestEvaluateGates:
     def test_passes_when_all_gates_satisfied_below(self) -> None:
         # Bracket [60, 62] with forecast 65 → BELOW by 3°F (gap_to_upper=3).
         # NO wins iff error < 3 → from realistic_errors, 22/26 = 0.846
-        # Market NO ask = 1 - 0.10 = 0.90. Edge_pp = 0.846 - 0.90 = -0.054 (NEGATIVE)
-        # So this should REJECT on edge_below_floor — set up a better scenario.
-        # Use no_ask = 0.70 (best_bid_yes = 0.30) instead.
+        # Use best_bid_yes=0.31 → no_ask=0.69 (below FLIP_NO_TO_YES_THRESHOLD
+        # of 0.70 so we don't trigger the flip experiment).
+        # Edge_pp = 0.846 - 0.69 = +0.156 (well above 3pp floor).
         ct = _stub_contract(
-            lower_f=60.0, upper_f=62.0, best_bid_yes=0.30,
+            lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
         )
         engine = _make_engine_with(_realistic_errors)
         plan, diag = tns.evaluate_tail_no_bracket(
@@ -223,6 +223,78 @@ class TestEvaluateGates:
         assert diag.edge_distance_f == pytest.approx(3.0)
         assert plan.outcome == "NO"
         assert plan.category == "weather_tail_no"
+
+    def test_flip_when_no_ask_above_threshold(self) -> None:
+        """Apr 28 2026 PM: no_ask >= 0.70 → buy YES instead of NO.
+
+        Same selection logic; only the final endpoint flips. Tagged with
+        category=weather_tail_no_flipped for A/B audit. Token_id is the
+        YES token, side/outcome is YES, and metadata.flipped_from_no_ask
+        records the original NO ask for the 30-day comparison.
+        """
+        ct = _stub_contract(
+            lower_f=60.0, upper_f=62.0,
+            best_bid_yes=0.20,   # no_ask = 0.80 (above flip threshold)
+            best_ask_yes=0.22,
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=66.0,  # gap=4, p_no_emp=0.885
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is not None, f"expected flip pass, rejected with: {diag.reject_reason}"
+        assert plan.outcome == "YES"
+        assert plan.side == "YES"
+        assert plan.category == "weather_tail_no_flipped"
+        assert plan.token_id == "yes_token_123"  # not the NO token
+        assert plan.reference_price == pytest.approx(0.22)  # yes_ask
+        assert plan.metadata["token_side"] == "YES"
+        assert plan.metadata["flipped_from_no_ask"] == pytest.approx(0.80)
+        # Edge from YES side is mathematically negative-by-construction
+        assert plan.metadata["edge_after_fees"] < 0
+
+    def test_no_flip_at_threshold_boundary(self) -> None:
+        """At no_ask = 0.69 (just below 0.70), still buy NO."""
+        ct = _stub_contract(
+            lower_f=60.0, upper_f=62.0,
+            best_bid_yes=0.31,   # no_ask = 0.69 (just below threshold)
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=65.0,
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is not None
+        assert plan.outcome == "NO"
+        assert plan.category == "weather_tail_no"
+
+    def test_flip_rejects_when_yes_token_missing(self) -> None:
+        """Flip-eligible position with no YES token → reject (don't fall back to NO)."""
+        ct = _stub_contract(
+            lower_f=60.0, upper_f=62.0,
+            best_bid_yes=0.20,   # no_ask = 0.80 → flip-eligible
+            best_ask_yes=0.22,
+        )
+        # Override token_id_yes to empty
+        ct = BracketContract(
+            market_id=ct.market_id, city=ct.city, target_date=ct.target_date,
+            lower_f=ct.lower_f, upper_f=ct.upper_f, question=ct.question,
+            market_price_yes=ct.market_price_yes,
+            best_ask_yes=ct.best_ask_yes, best_bid_yes=ct.best_bid_yes,
+            spread=ct.spread, liquidity=ct.liquidity,
+            token_id_yes="",   # ← missing YES token
+            token_id_no=ct.token_id_no,
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=66.0,  # gap=4 so we clear edge floor
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is None
+        assert "flip_yes_token_missing" in diag.reject_reason
 
     def test_rejects_when_forecast_inside_bracket(self) -> None:
         ct = _stub_contract(lower_f=60.0, upper_f=70.0)
@@ -438,8 +510,10 @@ class TestAnalyzeIntegration:
         assert result.diagnostics["reject_counters"]["no_forecast_for_target"] == 1
 
     def test_strategy_name_and_category_propagate(self) -> None:
+        # Use best_bid_yes=0.31 → no_ask=0.69 (just below FLIP_NO_TO_YES_THRESHOLD
+        # of 0.70) so this test exercises the normal NO path, not the flip experiment.
         ct = _stub_contract(
-            city="london", lower_f=60.0, upper_f=62.0, best_bid_yes=0.30,
+            city="london", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
         )
         engine = _make_engine_with(_realistic_errors)
         result = tns.analyze_tail_no_brackets(

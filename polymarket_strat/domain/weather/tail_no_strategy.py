@@ -98,6 +98,23 @@ EDGE_FLOOR_PP: float = 0.03   # 3pp empirical hit rate vs market NO
 WIDE_BRACKET_F: float = 10.0       # bracket width threshold
 WIDE_BRACKET_MIN_NO_ASK: float = 0.50  # min NO ask for wide-bracket entry
 
+# Apr 28 2026 (PM) — Subset NO→YES flip experiment.
+# Hypothesis: at high NO ask (>= 0.70), our model systematically
+# over-predicts NO probability. Historical 168h shadow simulation showed
+# flipping at this bucket would have netted +$340 vs realized −$121 NO.
+# Operational design:
+#   - All NO selection logic upstream is unchanged.
+#   - At plan-construction time, if no_ask >= FLIP_NO_TO_YES_THRESHOLD,
+#     swap the final endpoint: buy YES at yes_ask using the YES token.
+#   - Tag with FLIP_CATEGORY so the rebalance loop skip-lists it
+#     (buy-and-hold for clean A/B vs the control NO trades).
+#   - Trades are logged with token_side="YES" and metadata.flipped_from_no_ask
+#     so 30-day audit can compare flip P&L vs same-bucket NO P&L.
+# To DISABLE: set FLIP_NO_TO_YES_THRESHOLD = None.
+# Capital risk: ~2-3 trades/week × $30 notional = ~$60-90/week worst case.
+FLIP_NO_TO_YES_THRESHOLD: float | None = 0.70
+FLIP_CATEGORY: str = "weather_tail_no_flipped"
+
 # Position sizing tiers (EV per dollar invested)
 SIZE_TIER_LARGE_EV: float = 1.0
 SIZE_TIER_MEDIUM_EV: float = 0.3
@@ -447,6 +464,86 @@ def evaluate_tail_no_bracket(
         f"empirical_p_no={p_no_emp*100:.1f}%, edge_pp={edge_pp*100:+.2f}pp",
         f"EV/$1={ev_per_dollar:+.4f}, size=${target_notional:.0f}",
     ]
+
+    # === Apr 28 2026 PM — EXPERIMENTAL FLIP BRANCH ===
+    # If no_ask >= FLIP_NO_TO_YES_THRESHOLD, swap final side from NO to YES
+    # at the same opportunity. Selection logic above is unchanged. The
+    # flipped trade is mathematically negative-EV by the model (we're
+    # betting against our own probability estimate); the experiment tests
+    # whether the model has a systematic high-NO-ask bias that makes the
+    # contrarian side actually winning. Tagged FLIP_CATEGORY for A/B audit.
+    if FLIP_NO_TO_YES_THRESHOLD is not None and no_ask >= FLIP_NO_TO_YES_THRESHOLD:
+        yes_ask_for_flip = float(contract.best_ask_yes or 0)
+        yes_token_id = contract.token_id_yes or ""
+        if yes_ask_for_flip <= 0 or yes_ask_for_flip >= 1:
+            diag.reject_reason = (
+                f"flip_yes_ask_invalid (yes_ask={yes_ask_for_flip:.4f})"
+            )
+            return None, diag
+        if not yes_token_id:
+            diag.reject_reason = "flip_yes_token_missing"
+            return None, diag
+
+        # YES-side model probability and edge (note: edge is negative by
+        # construction — that's the whole point of the experiment).
+        p_yes_emp = 1.0 - p_no_emp
+        edge_pp_yes = p_yes_emp - yes_ask_for_flip
+
+        flip_rationale = rationale + [
+            f"FLIPPED to YES at yes_ask={yes_ask_for_flip:.3f}",
+            f"YES p_model={p_yes_emp:.3f}, edge_yes={edge_pp_yes*100:+.2f}pp",
+            "experiment: high-NO-ask contrarian (Apr 28 2026)",
+        ]
+
+        plan = TradePlan(
+            strategy_name=STRATEGY_NAME,
+            market=contract.market_id,
+            question=contract.question,
+            category=FLIP_CATEGORY,
+            outcome="YES",
+            token_id=yes_token_id,
+            side="YES",
+            signal_score=ev_per_dollar,  # original tail-NO signal score
+            target_notional=target_notional,
+            reference_price=yes_ask_for_flip,
+            best_ask=yes_ask_for_flip,
+            # YES bid ≈ 1 - NO ask (when no_ask is the YES bid complement)
+            best_bid=max(0.0, 1.0 - no_ask),
+            spread=float(contract.spread or 0.02),
+            top_ask_size=float(contract.liquidity or 0),
+            top_bid_size=float(contract.liquidity or 0),
+            risk_score=p_no_emp,  # higher risk_score on flipped trades
+            expected_value=ev_per_dollar * target_notional,  # tail-NO EV
+            executable=True,
+            rationale=flip_rationale,
+            metadata={
+                "city": contract.city,
+                "target_date": contract.target_date.isoformat(),
+                "bracket_lower_f": bracket_lower,
+                "bracket_upper_f": bracket_upper,
+                "direction": direction,
+                "edge_distance_f": edge_distance,
+                "forecast_high_f": forecast_high_f,
+                "lead_hours": lead_hours,
+                "yes_ask": yes_ask_for_flip,
+                "empirical_p_yes": p_yes_emp,
+                "market_implied_p_yes": yes_ask_for_flip,
+                "correlation_group": group_key,
+                # Save-trade convention — model_prob is the side's P(win),
+                # for flipped trades that's YES's empirical_p_yes.
+                "model_prob": p_yes_emp,
+                "token_side": "YES",
+                "edge_after_fees": edge_pp_yes,
+                # Experiment tracking — original NO-side numbers so 30-day
+                # audit can compare flipped P&L against what NO would have made.
+                "flipped_from_no_ask": no_ask,
+                "shadow_no_token_id": token_id_no,
+                "shadow_no_empirical_p": p_no_emp,
+                "shadow_no_edge_pp": edge_pp,
+            },
+        )
+        return plan, diag
+    # === END FLIP BRANCH ===
 
     plan = TradePlan(
         strategy_name=STRATEGY_NAME,
