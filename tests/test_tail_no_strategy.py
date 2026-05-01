@@ -156,7 +156,10 @@ class TestEmpiricalHitRate:
 
 def _stub_contract(
     *,
-    city: str = "london",
+    city: str = "milan",  # Apr 29 2026: switched from london (bias -0.20)
+                          # to milan (no bias) so existing tests stay
+                          # neutral re: per-city calibration. London-
+                          # specific behavior tested explicitly elsewhere.
     target_offset_days: int = 1,
     lower_f: float = 60.0,
     upper_f: float = 62.0,
@@ -430,9 +433,64 @@ class TestEvaluateGates:
         assert plan is None
         assert diag.reject_reason == "in_cooldown"
 
-    def test_correlation_group_cap_blocks_overflow(self) -> None:
+    def test_city_bias_correction_applied_london(self) -> None:
+        """Apr 29 2026: London has WF bias −0.20, so an entry that would
+        pass with raw p_no should now reject after calibration.
+
+        Setup: forecast 65, bracket [60, 62] → gap_to_upper=3, p_no_emp ≈ 0.846
+        no_ask = 0.69 (best_bid_yes=0.31)
+        edge_pp_raw = 0.846 − 0.69 = +15.6pp (passes)
+        After bias −0.20: p_calibrated = 0.646
+        edge_pp_calibrated = 0.646 − 0.69 = −4.4pp (REJECT)
+        """
         ct = _stub_contract(
-            city="london", lower_f=60.0, upper_f=62.0, best_bid_yes=0.30,
+            city="london", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=65.0,
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is None
+        assert "edge_below_floor" in diag.reject_reason
+        assert "city_bias=-0.200" in diag.reject_reason
+
+    def test_city_bias_no_correction_for_neutral_city(self) -> None:
+        """Milan has no bias entry — should pass identically to baseline."""
+        ct = _stub_contract(
+            city="milan", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=65.0,
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is not None, f"expected pass, rejected with: {diag.reject_reason}"
+        assert plan.metadata["city_bias"] == 0.0
+        assert plan.metadata["empirical_p_no_calibrated"] == plan.metadata["empirical_p_no"]
+
+    def test_city_bias_positive_boost(self) -> None:
+        """LA has +0.06 boost; should produce slightly higher edge."""
+        ct = _stub_contract(
+            city="la", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
+        )
+        engine = _make_engine_with(_realistic_errors)
+        plan, diag = tns.evaluate_tail_no_bracket(
+            contract=ct, forecast_high_f=65.0,
+            hit_rate_engine=engine,
+            constraints=_stub_constraints(), portfolio_state=_stub_portfolio(),
+        )
+        assert plan is not None, f"rejected with: {diag.reject_reason}"
+        assert plan.metadata["city_bias"] == pytest.approx(0.06)
+        assert plan.metadata["empirical_p_no_calibrated"] > plan.metadata["empirical_p_no"]
+
+    def test_correlation_group_cap_blocks_overflow(self) -> None:
+        # Apr 29: switched from london to milan (no bias correction)
+        # so this test isolates the corr-group cap, not city calibration.
+        ct = _stub_contract(
+            city="milan", lower_f=60.0, upper_f=62.0, best_bid_yes=0.30,
         )
         engine = _make_engine_with(_realistic_errors)
         # Pre-fill the western_europe group at $190 → next $30 trade overflows.
@@ -472,7 +530,7 @@ class TestAnalyzeIntegration:
         contracts = []
         for i in range(10):
             ct = _stub_contract(
-                city="london",
+                city="milan",  # Apr 29: was london, switched to milan (no bias)
                 lower_f=60.0 + i * 0.001,
                 upper_f=62.0 + i * 0.001,
                 best_bid_yes=0.30,
@@ -512,8 +570,9 @@ class TestAnalyzeIntegration:
     def test_strategy_name_and_category_propagate(self) -> None:
         # Use best_bid_yes=0.31 → no_ask=0.69 (just below FLIP_NO_TO_YES_THRESHOLD
         # of 0.70) so this test exercises the normal NO path, not the flip experiment.
+        # Apr 29: switched from london to milan (no bias correction).
         ct = _stub_contract(
-            city="london", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
+            city="milan", lower_f=60.0, upper_f=62.0, best_bid_yes=0.31,
         )
         engine = _make_engine_with(_realistic_errors)
         result = tns.analyze_tail_no_brackets(

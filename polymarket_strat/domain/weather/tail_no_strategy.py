@@ -56,6 +56,7 @@ from polymarket_strat.domain.models import (
 from polymarket_strat.domain.weather.models import (
     BracketContract, CITY_REGISTRY, WeatherModel,
 )
+from polymarket_strat.domain.weather import city_calibration
 
 
 # ============================================================================
@@ -410,12 +411,25 @@ def evaluate_tail_no_bracket(
         return None, diag
     diag.empirical_hit = p_no_emp
 
-    # Edge in percentage points: empirical_p_no - market_implied_p_no.
+    # Apr 29 2026 — Per-city walk-forward bias correction.
+    # Strategy-aligned WF (n=96-172 per city, narrow brackets in
+    # tail-NO band) measured systematic per-city gap between model and
+    # reality. We deflate (or boost) p_no_emp by that gap before edge
+    # calculation. See city_calibration.py for the dict + math.
+    city_bias = city_calibration.get_no_bias(contract.city)
+    p_no_calibrated = p_no_emp + city_bias
+    # Clamp to [0, 1] in case city_bias pushes outside valid prob range.
+    p_no_calibrated = max(0.0, min(1.0, p_no_calibrated))
+
+    # Edge in percentage points: calibrated_p_no − market_implied_p_no.
     # Market implies p_no = no_ask (for risk-neutral pricing).
-    edge_pp = p_no_emp - no_ask
+    edge_pp = p_no_calibrated - no_ask
     diag.edge_pp = edge_pp
     if edge_pp < EDGE_FLOOR_PP:
-        diag.reject_reason = f"edge_below_floor ({edge_pp*100:+.2f}pp)"
+        diag.reject_reason = (
+            f"edge_below_floor ({edge_pp*100:+.2f}pp, "
+            f"city_bias={city_bias:+.3f})"
+        )
         return None, diag
 
     # Gate 7: token_id_no exists
@@ -432,8 +446,9 @@ def evaluate_tail_no_bracket(
         diag.reject_reason = "in_cooldown"
         return None, diag
 
-    # Gate 9: position sizing & correlation-group cap
-    ev_per_dollar = _ev_per_dollar(p_no_emp, no_ask)
+    # Gate 9: position sizing & correlation-group cap.
+    # EV uses calibrated p_no (not raw) so sizing reflects real edge.
+    ev_per_dollar = _ev_per_dollar(p_no_calibrated, no_ask)
     diag.ev_per_dollar = ev_per_dollar
     target_notional = _position_size_usd(ev_per_dollar)
     if target_notional <= 0:
@@ -461,7 +476,10 @@ def evaluate_tail_no_bracket(
         f"lead={lead_hours:.1f}h, fc={forecast_high_f:.1f}°F",
         f"bracket=[{bracket_lower:.1f},{bracket_upper:.1f}]°F",
         f"no_ask={no_ask:.4f}, market_implied_p_no={no_ask*100:.1f}%",
-        f"empirical_p_no={p_no_emp*100:.1f}%, edge_pp={edge_pp*100:+.2f}pp",
+        (f"empirical_p_no_raw={p_no_emp*100:.1f}%, "
+         f"city_bias={city_bias:+.3f}, "
+         f"calibrated={p_no_calibrated*100:.1f}%, "
+         f"edge_pp={edge_pp*100:+.2f}pp"),
         f"EV/$1={ev_per_dollar:+.4f}, size=${target_notional:.0f}",
     ]
 
@@ -484,14 +502,16 @@ def evaluate_tail_no_bracket(
             diag.reject_reason = "flip_yes_token_missing"
             return None, diag
 
-        # YES-side model probability and edge (note: edge is negative by
-        # construction — that's the whole point of the experiment).
-        p_yes_emp = 1.0 - p_no_emp
-        edge_pp_yes = p_yes_emp - yes_ask_for_flip
+        # YES-side model probability and edge — uses CALIBRATED p_no.
+        # Apr 29 2026: when bias correction deflates p_no, p_yes_calibrated
+        # rises correspondingly. This makes flip-EV measurement honest.
+        p_yes_calibrated = 1.0 - p_no_calibrated
+        edge_pp_yes = p_yes_calibrated - yes_ask_for_flip
 
         flip_rationale = rationale + [
             f"FLIPPED to YES at yes_ask={yes_ask_for_flip:.3f}",
-            f"YES p_model={p_yes_emp:.3f}, edge_yes={edge_pp_yes*100:+.2f}pp",
+            (f"YES p_model_calibrated={p_yes_calibrated:.3f} "
+             f"(raw {(1-p_no_emp):.3f}), edge_yes={edge_pp_yes*100:+.2f}pp"),
             "experiment: high-NO-ask contrarian (Apr 28 2026)",
         ]
 
@@ -526,12 +546,15 @@ def evaluate_tail_no_bracket(
                 "forecast_high_f": forecast_high_f,
                 "lead_hours": lead_hours,
                 "yes_ask": yes_ask_for_flip,
-                "empirical_p_yes": p_yes_emp,
+                "empirical_p_yes": 1.0 - p_no_emp,             # raw
+                "empirical_p_yes_calibrated": p_yes_calibrated, # post-bias
+                "city_bias": city_bias,
                 "market_implied_p_yes": yes_ask_for_flip,
                 "correlation_group": group_key,
-                # Save-trade convention — model_prob is the side's P(win),
-                # for flipped trades that's YES's empirical_p_yes.
-                "model_prob": p_yes_emp,
+                # Save-trade convention — model_prob is the side's P(win).
+                # Apr 29 2026: now uses calibrated YES probability (= 1 −
+                # calibrated p_no). Bias correction propagates to flip side.
+                "model_prob": p_yes_calibrated,
                 "token_side": "YES",
                 "edge_after_fees": edge_pp_yes,
                 # Experiment tracking — original NO-side numbers so 30-day
@@ -539,6 +562,7 @@ def evaluate_tail_no_bracket(
                 "flipped_from_no_ask": no_ask,
                 "shadow_no_token_id": token_id_no,
                 "shadow_no_empirical_p": p_no_emp,
+                "shadow_no_empirical_p_calibrated": p_no_calibrated,
                 "shadow_no_edge_pp": edge_pp,
             },
         )
@@ -561,7 +585,7 @@ def evaluate_tail_no_bracket(
         spread=float(contract.spread or 0.02),
         top_ask_size=float(contract.liquidity or 0),
         top_bid_size=float(contract.liquidity or 0),
-        risk_score=1.0 - p_no_emp,
+        risk_score=1.0 - p_no_calibrated,
         expected_value=ev_per_dollar * target_notional,
         executable=True,
         rationale=rationale,
@@ -576,6 +600,8 @@ def evaluate_tail_no_bracket(
             "lead_hours": lead_hours,
             "no_ask": no_ask,
             "empirical_p_no": p_no_emp,
+            "empirical_p_no_calibrated": p_no_calibrated,
+            "city_bias": city_bias,
             "market_implied_p_no": no_ask,
             "edge_pp": edge_pp,
             "ev_per_dollar": ev_per_dollar,
@@ -584,11 +610,12 @@ def evaluate_tail_no_bracket(
             # reads these three keys directly into the DB columns to
             # keep edge units consistent across strategies (see CLAUDE
             # §15.x edge-convention audit). model_prob is the side's
-            # P(win); for NO trades that's empirical_p_no. token_side
-            # is the side label so analytics can filter NO vs YES.
-            # edge_after_fees is the fee-adjusted PP gap, NOT the
-            # raw EV-per-dollar.
-            "model_prob": p_no_emp,
+            # P(win) — Apr 29 2026 now uses calibrated value (raw
+            # tail-NO empirical hit rate + per-city WF bias correction).
+            # token_side is the side label so analytics can filter NO
+            # vs YES. edge_after_fees is the fee-adjusted PP gap, NOT
+            # the raw EV-per-dollar.
+            "model_prob": p_no_calibrated,
             "token_side": "NO",
             "edge_after_fees": edge_pp,
         },
