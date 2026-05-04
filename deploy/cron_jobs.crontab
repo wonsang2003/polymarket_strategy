@@ -53,3 +53,16 @@ TZ=Asia/Seoul
 # Runs after compute_per_city_ece at 05:35 KST. Reads trade_history directly,
 # so it always has the freshest data (no dependency on walk-forward CSVs).
 35 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_no_isotonic.py >> /home/ubuntu/polymarket/logs/fit_no_isotonic.log 2>&1
+
+# May 3 2026 — AI strategy review automation (Phase 1+2 of self-improving system).
+#   Daily brief : 06:00 KST every day. Sonnet 4.5. ~$0.05/run = $1.50/month.
+#                 Yesterday's data + 1 bias detection + 1 action recommendation.
+#                 Posted to Telegram.
+#   Weekly review: Wed + Sun 09:00 KST. Opus. ~$0.25/run × 2/wk = $2/month.
+#                  7d data + code excerpts + hypothesis tracker + structured
+#                  proposed changes for user reply (YES_<num> / NO_<num>).
+#                  Saves full report to reports/strategy_reviews/.
+# Both fail gracefully — post error to Telegram if API key/credit missing
+# instead of silent failure.
+0 6 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/daily_brief.py >> /home/ubuntu/polymarket/logs/daily_brief.log 2>&1
+0 9 * * 0,3 cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/strategy_review.py >> /home/ubuntu/polymarket/logs/strategy_review.log 2>&1
