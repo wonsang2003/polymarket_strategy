@@ -54,9 +54,25 @@ CITY_NO_BIAS: dict[str, float] = {
     "miami":        -0.07,  # WF gap −0.065, n=172
     "sydney":       -0.05,  # WF gap −0.054, n=172
 
+    # 2026-05-10 trade-history-evidence overrides (H_2026_05_10_01).
+    # WF originally omitted these 4 cities as "within noise" (|gap| < 0.05),
+    # but 7d realized trade history (n≥20 each) shows them as the worst
+    # bleeders WITHOUT bias protection:
+    #   milan      −$295/7d (n=23)
+    #   seoul      −$170/7d (n=20)
+    #   hong_kong  −$149/7d (n=22)
+    #   sao_paulo   −$82/7d (n=26)
+    # Conservative magnitude (smaller than WF-cap'd cities) because we're
+    # going below the WF |gap| < 0.05 threshold based on shorter-window
+    # evidence. Re-evaluate at next strategy_review (Sun 09:00 KST) —
+    # evaluator will compute 7d post-ship verdict automatically.
+    "milan":       -0.10,
+    "seoul":       -0.10,
+    "hong_kong":   -0.10,
+    "sao_paulo":   -0.05,
+
     # Within noise — no correction (|gap| < 0.05, omitted):
-    # hong_kong (-0.049), nyc (-0.042), sao_paulo (-0.016),
-    # milan (+0.001), seoul (+0.022)
+    # nyc (-0.042)
 
     # Mild positive (model under-predicts — boost):
     "la":           +0.06,  # WF gap +0.063, n=129
