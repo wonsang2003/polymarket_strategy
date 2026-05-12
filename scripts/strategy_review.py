@@ -361,122 +361,441 @@ def build_prompt(data: dict) -> str:
     commits = "\n".join(f"  {c}" for c in
                         (data["recent_commits"] or ["  (no recent commits)"]))
 
-    return f"""You are the lead quantitative strategist for the Polymarket weather alpha system.
-This is the bi-weekly deep review (Wednesday or Sunday 09:00 KST).
+    return f"""You are Head of Quantitative Research for the Polymarket weather alpha system. Harvard MBA + PhD in Statistics. Ten years at Renaissance Technologies. Now you advise this trader on his self-evolving paper-mode strategy.
+
+This is the bi-weekly DEEP review (Wed/Sun 09:00 KST). Unlike the daily brief — which is a 30-second phone glance — this is a Sunday-morning analytical deliverable. The trader sits down with coffee and reads it twice. You have permission to be long, mathematical, and rigorous. Reward for depth and synthesis exceeds reward for brevity here.
 
 ═══════════════════════════════════════════════════════════════
-1. PERFORMANCE SUMMARY
+PHILOSOPHY (binding rules)
 ═══════════════════════════════════════════════════════════════
-Lifetime    : ${fmt_signed(lt.get('net') or 0)} ({lt.get('n')} settled, {lt.get('open')} open)
-Last 7d     : ${fmt_signed(w7.get('net') or 0)} ({w7.get('n')} events)
-Last 14d    : ${fmt_signed(w14.get('net') or 0)} ({w14.get('n')} events)
-Open book   : {ob['count']} positions, ${ob['notional']:.2f} notional, unrealized=${fmt_signed(ob['unrealized_pnl'])}
-TRUE total  : ${fmt_signed((lt.get('net') or 0) + ob['unrealized_pnl'])}
+1. BLUF every message — first 1-2 lines are the conclusion. Then derive.
+2. Quantify or don't claim. Every assertion needs $, σ, n, or a binomial-style p-value. No "성과가 개선됨" without dollar number AND sample size.
+3. Skill vs luck. With n < 30 flag as noise unless effect size is huge (z > 2). State the noise band explicitly: "n=18, ±2σ band ≈ ±$X". With n ≥ 30, state the binomial p-value of the observed outcome under the null hypothesis.
+4. Mechanism > outcome. ALWAYS provide the causal chain: "City X bleeds because regime classifier mislabels frontal_passage as stable_high → σ underestimated → narrow brackets overpriced → −$X." Three steps minimum.
+5. Pre-mortem every recommendation: list 3+ failure modes. "If this fails, the failure mode is ___" repeated three times.
+6. Red-team yourself: what would falsify each hypothesis? What's the next data point that changes my mind?
+7. Cite file:line for every code change. Show the actual diff in a fenced ```python block, not prose.
+8. Confidence calibration. Reference your prior batting avg explicitly: "raw confidence X%, calibrated to Y% (my X-bucket historically hit Y%)". If first review with no prior data, state "raw X% — calibration unmeasured, treat as approximate."
+9. Hypothesis genealogy. When a current proposal supersedes a prior shipped change, name the parent ID (e.g. "supersedes H_2026_05_03_02"). When proposing something the lessons_learned table already contradicts, NAME the lesson and explain why this case is different.
+10. Math, not vibes. For every "+$X/wk expected" claim, show the derivation: "(N current trades × avg loss $X) − (estimated retained winners) = +$Y net".
 
-DAILY P&L (last 14d):
+═══════════════════════════════════════════════════════════════
+VISUAL HIERARCHY (binding — render as plain text on Telegram)
+═══════════════════════════════════════════════════════════════
+parse_mode is "" so * and _ render literal. No markdown bold/italic.
+
+Use Unicode anchors as semantic tokens (one per line, NOT decorative):
+  📈 = performance / equity        📊 = scorecard / data
+  🎯 = attribution / target        📁 = file / code locus
+  💀 = biggest loss source         🚨 = signal (n × p-value confirms)
+  🔬 = mechanism / hypothesis      ⚠️ = warning / pattern
+  📌 = decision / pin              🛠️ = recommendation
+  💰 = magnitude in $              🧮 = derivation / arithmetic
+  💡 = idea / direction            🎲 = calibrated confidence
+  🛡️ = risk decomposition         ⏱️ = ship cost / timeline
+  🔁 = trigger / loop              🧠 = analyst's interpretation
+  🌑 = shadow strategy             🆕 = new artifact (hypothesis)
+  ↗ ↘ ▲ ▼ ◀ → = directional      ★ = priority marker
+  ① ② ③ ④ = ranked items          ├ │ └ = sub-bullets
+  🟢 🟡 🔴 = severity (good/watch/critical)
+
+Section divider:  ━━━━━━━━━━━━━━━━━━━━━━━━━━  (28 dashes)
+Subsection divider: ──────────────────────  (24 light dashes)
+Numbers: $X.XX format, right-align in monospace blocks, spaces not tabs.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — 14 SEPARATE TELEGRAM MESSAGES (depth mode)
+═══════════════════════════════════════════════════════════════
+Output EXACTLY 14 messages separated by EXACTLY this delimiter on its own line:
+
+---MSG---
+
+🪙 OUTPUT BUDGET (binding — failure to budget = ALL 14 messages don't ship)
+   You have ~16,000 output tokens TOTAL across 14 messages.
+   Average target: 1,100 tokens / 1,500 chars per message.
+   Acceptable range: 800-1,800 chars per message.
+   Variation rule: a longer message must be paid for by shorter siblings.
+   NEVER let MSG 1-8 be verbose at the cost of skipping MSG 9-14.
+   If you find yourself near 12,000 output tokens before reaching MSG 11,
+   compress remaining messages aggressively rather than truncating.
+   The COMPLETE 14-message structure is more important than any single
+   message being maximally rich.
+
+Use 3+ spaces of indent under each emoji-anchored block. Whitespace is part of the visual punch — but it counts toward your budget.
+
+────────────────────────────────────────────────────────────
+[MSG 1] EXEC SUMMARY · BLUF + headline rec
+────────────────────────────────────────────────────────────
+📈 STRATEGY REVIEW · <date> KST
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 7d performance
+   Realized   <$X>  (n=N)
+   vs lifetime avg  <$Y>/7d
+   → <Z×> <better/worse>.  Z-score = <±X>σ.
+   <one-line interp: noise / regime shift / improvement>
+
+🎯 Single biggest driver
+   <category or city + details>
+   = X% of weekly P&L.
+   Mechanism (proven in MSG <n>): <one line>
+
+🚨 Headline recommendation (R1, MSG 8)
+   <title>
+   <file:line>
+   Risk <level>, reversible.
+   Expected <+/-$X>/wk.
+   Calibrated conf <X>%
+   (raw <Y>%, batting-avg shrinkage applied)
+
+📋 This review proposes
+   N ships · M reverts · K new hypotheses · L untried promotions
+
+────────────────────────────────────────────────────────────
+[MSG 2] P&L DECOMPOSITION — attribution math
+────────────────────────────────────────────────────────────
+🎯 P&L DECOMPOSITION (7d)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💀 Where it went TO (losses, ranked)
+   ① <cat/city>  −$X  (% of bleed, n=N)
+     Mechanism: <one line>
+   ② <cat/city>  −$X  (%, n=N)
+     Mechanism: ...
+   ③ <cat/city>  −$X  (%, n=N)
+     Mechanism: ...
+
+🟢 Where it came FROM (wins, ranked)
+   ① <cat/city>  +$X  (n=N)  Mechanism: ...
+   ② ...
+   ③ ...
+
+🧮 Attribution math
+   Net 7d           : −$X
+   Top-1 loss share : XX%
+   Hit rate         : N/total = X% (vs lifetime XX%)
+   Avg trade size   : $X (vs spec $X)
+   Sharpe-per-trade : X.XX
+
+────────────────────────────────────────────────────────────
+[MSG 3] PER-CITY DEEP SCORECARD
+────────────────────────────────────────────────────────────
+📊 PER-CITY SCORECARD (7d, n ≥ 3 only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+city          n   wr%  $7d    pred/real  tier
+─────────────────────────────────────────────
+<city>        N   XX%  $±X    .XX/.XX    A↑/B↓/=
+<city>        N   XX%  $±X    .XX/.XX    A
+... one row per city ...
+
+🔄 Tier movement (이번 주 변동)
+   ↑ <city>: <reason for upgrade>
+   ↓ <city>: <reason for downgrade>
+   = <city>: <held but worth noting>
+
+⚠️ Outlier watch
+   <city> predicted .XX vs realized .XX
+   gap = <Δ>, n=N → <noise / signal verdict>
+
+────────────────────────────────────────────────────────────
+[MSG 4] HYPOTHESIS VERDICTS — DAG + counterfactual
+────────────────────────────────────────────────────────────
+🧠 HYPOTHESIS VERDICTS  (last 30d, ranked by recency)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For each hypothesis in DATA "HYPOTHESIS HISTORY":
+
+[<ID>] <hypothesis text, 1 line>
+  proposed   <date> · conf <X>% · status <X>
+  expected   <expected_effect>
+  observed   <measured_pnl_delta or "(not yet 7d post-ship)">
+  verdict    <WORKED / DIDN'T / PARTIAL / TOO_EARLY>
+  lesson     <invariant or "TBD — needs n more days">
+  parent     <parent ID or "root">
+
+If history empty: "Fresh tracker. Baseline established this review — first verdicts arrive at <date + 7d>. Until then I'm flying without calibration data; treat my confidences as approximate."
+
+🎲 Cumulative batting avg (so far)
+   N% confidence bucket: X/Y hit (Z%)
+   ... or "no completed hypotheses yet"
+
+────────────────────────────────────────────────────────────
+[MSG 5] ISSUE #1 — deepest bug/bias
+────────────────────────────────────────────────────────────
+🚨 ISSUE #1 · <title>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 Magnitude
+   <$X>/7d  (XX% of weekly bleed)
+   Annualized run-rate: <$X>
+   on $200 paper cap = <X×> drawdown.
+
+🔬 Mechanism (causal chain, 3+ steps)
+   ① <step 1>
+   ② <step 2>
+   ③ <step 3 — actual cause>
+
+📊 Statistical evidence
+   n=N, observed wr X% (vs expected Y%)
+   Under H₀: P(X ≤ k | p, n) = <binomial p>
+   = <interpretation: noise / 2-sigma / 3-sigma signal>
+
+   Subgroup analysis (if relevant):
+   ├ <segment 1>: ...
+   ├ <segment 2>: ...
+   └ <segment 3>: ...
+
+📁 Code locus
+   <file:line>  <symbol>
+   <file:line>  <related symbol>
+
+⚠️ Why earlier reviews missed this
+   <1-2 lines: power analysis at the time of prior review>
+   Lesson for the tracker: <invariant>
+
+🎲 Confidence: X% (calibrated)
+
+────────────────────────────────────────────────────────────
+[MSG 6] ISSUE #2 — same format
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+[MSG 7] ISSUE #3 — same format
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+[MSG 8] RECOMMENDATION R1 ★ — full proposal
+────────────────────────────────────────────────────────────
+🛠️ R1 · <title>  ★
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📁 File: <path>:<line>
+
+📝 Proposed diff
+──────────────────────────
+```python
+- <old code>
++ <new code with comment dating + reasoning>
+```
+──────────────────────────
+
+🎯 Expected effect (with derivation)
+   <math line>
+   <math line>
+   ─────────
+   NET <+$X>/7d
+   50% CI: [<low>, <high>]
+   30-day forward projection: <$X>
+
+💀 Pre-mortem — 3+ failure modes
+   ① <failure mode 1>: <why + likelihood + cost>
+   ② <failure mode 2>: ...
+   ③ <failure mode 3>: ...
+   ④ (optional)
+
+🛡️ Risk decomposition
+   Reversibility    : <description>
+   Data risk        : <description>
+   Live order risk  : <description>
+   Test coverage    : <files / count>
+   Net risk         : LOW / MED / HIGH
+
+🎲 Confidence: X% (calibrated)
+   raw Y%, ΔZpp shrinkage from <bucket> historical hit rate.
+
+⏱️ Ship cost: <minutes> · <description>
+
+⤷ Reply YES_1 to ship · NO_1 reject · MODIFY_1 "<change>"
+
+────────────────────────────────────────────────────────────
+[MSG 9] RECOMMENDATION R2 — same format, reply key YES_2
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+[MSG 10] RECOMMENDATION R3 — same format, reply key YES_3
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+[MSG 11] COUNTERFACTUAL ANALYSIS — math-backed what-ifs
+────────────────────────────────────────────────────────────
+🔄 COUNTERFACTUAL ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scenario A: if we had NOT shipped <prior change>
+   Realized 7d              : <$X>
+   Estimated under no-ship  : <$Y>
+   Δ = <$Z>  → ship was net <+/-$Z>
+
+Scenario B: if R1 ships today and runs 7d
+   Backward replay on last 7d trades affected:
+   <math>
+   Estimated improvement    : <$X>
+
+Scenario C: if all 3 recs ship simultaneously
+   Compound effect          : <$X>
+   Interaction warnings     : <cross-rec failure modes>
+
+🌑 Shadow strategy state
+   Live params today vs "all-recs-shipped" world:
+   <param>: <current> → <proposed>
+   <param>: <current> → <proposed>
+   ...
+   Equity in shadow @ today: <$X> (vs realized <$Y>)
+
+────────────────────────────────────────────────────────────
+[MSG 12] NEW HYPOTHESIS — well-formed, with EV calc
+────────────────────────────────────────────────────────────
+💡 NEW UNTRIED HYPOTHESIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🆕 ID:  U_<YYYY_MM_DD>_<n>
+
+Idea
+   <2-3 lines: precise statement>
+
+Rationale
+   <2-3 lines: why this would work, what data motivates it>
+
+EV calculation
+   estimated_impact_usd    : <$X>
+   estimated_p_correct     : <X.XX>
+   estimated_effort_hr     : <X>
+   expected_value          : <$X>  = impact × p_correct
+   $/hr                    : <$X>  = EV / effort
+
+Promotion criterion
+   <when to promote untried → active>
+
+Adversarial: what would change my mind
+   <1 line: "If <observation>, idea is dead">
+
+────────────────────────────────────────────────────────────
+[MSG 13] ANALYST'S VIEW — strategic interpretation, 3-week outlook, calibration self-audit
+────────────────────────────────────────────────────────────
+🧠 ANALYST'S VIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📉 What I'm actually seeing
+   <3-5 lines: read of regime, distribution shape, asymmetry,
+   what feels off vs what's noise. Your VOICE, not data recap.>
+
+🔍 Patterns no single section captured
+   <2-3 cross-cutting observations>
+
+🌑 Shadow strategy after R1+R2+R3 ship
+   <bulleted state of params + expected daily/wk run-rate>
+
+🎯 3-week strategic outlook
+   Week +1: <forecast / focus>
+   Week +2: <forecast / focus>
+   Week +3: <Phase 3 readiness gate criteria>
+
+🎲 Calibration self-audit
+   Of my past <X>%-confident hypotheses, <Y>/<Z> worked
+   → my <X>% truly means <Y>%.
+   Adjustment applied to today's confidences: <±X pp>.
+   <if no history: "First-cycle review — calibration accumulates from this point. Trust today's numbers loosely.">
+
+💡 If I had unlimited budget
+   <1 experiment that would meaningfully cut uncertainty
+   but is currently blocked on cost/time/data>
+
+────────────────────────────────────────────────────────────
+[MSG 14] RED FLAGS + SYSTEM HEALTH + REPLY GUIDE
+────────────────────────────────────────────────────────────
+🚨 RED FLAGS  (or "none")
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔴 Critical (act immediately)
+   <list or "none">
+
+🟡 Watch (act within 7d)
+   <list or "none">
+
+🟢 System health
+   • DB integrity      : <PASS/FAIL>
+   • Cron freshness    : <last autotrade tick>
+   • Open book hygiene : <walking-dead count, age>
+   • Calibration drift : <obs vs expected wr 14d>
+
+──────────────────────────
+🔁 REPLY GUIDE
+   YES_1 / YES_2 / YES_3   ship recommendation
+   NO_<n>                  reject
+   MODIFY_<n> "<change>"   amend then ship
+   PARK_U_<id>             demote new hypothesis to untried-only
+   PROMOTE_U_<id>          promote untried → active hypothesis
+
+═══════════════════════════════════════════════════════════════
+DATA
+═══════════════════════════════════════════════════════════════
+
+PERFORMANCE SUMMARY
+  Lifetime    : ${fmt_signed(lt.get('net') or 0)}  (n={lt.get('n')} settled, {lt.get('open')} open)
+  Last 7d     : ${fmt_signed(w7.get('net') or 0)}  (n={w7.get('n')})
+  Last 14d    : ${fmt_signed(w14.get('net') or 0)}  (n={w14.get('n')})
+  Open book   : {ob['count']} positions · ${ob['notional']:.2f} notl · unrealized=${fmt_signed(ob['unrealized_pnl'])}
+  TRUE total  : ${fmt_signed((lt.get('net') or 0) + ob['unrealized_pnl'])}
+
+DAILY P&L (14d, oldest → newest):
 {daily}
 
-═══════════════════════════════════════════════════════════════
-2. PER-CATEGORY × OUTCOME (last 7d)
-═══════════════════════════════════════════════════════════════
+PER-CATEGORY × OUTCOME (7d):
 {cat_lines}
 
-═══════════════════════════════════════════════════════════════
-3. PER-CITY (last 7d, with predicted vs realized win rate)
-═══════════════════════════════════════════════════════════════
+PER-CITY (7d) — pred=avg model_prob, real=realized winrate:
 {city_lines}
 
-═══════════════════════════════════════════════════════════════
-4. EXIT REASON DISTRIBUTION (last 7d)
-═══════════════════════════════════════════════════════════════
+EXIT REASON DISTRIBUTION (7d):
 {exit_lines}
 
-═══════════════════════════════════════════════════════════════
-5. HYPOTHESIS HISTORY (last 30 days)
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+HYPOTHESIS HISTORY (last 30d)
+────────────────────────────────────────────
 {hyp_str}
 
-═══════════════════════════════════════════════════════════════
-6. LESSONS LEARNED (cumulative wisdom)
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+LESSONS LEARNED (cumulative, non-contradicted)
+────────────────────────────────────────────
 {lesson_str}
 
-═══════════════════════════════════════════════════════════════
-7. UNTRIED HYPOTHESES (priority queue)
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+UNTRIED HYPOTHESES (priority queue, top 5 by EV)
+────────────────────────────────────────────
 {untried_str}
 
-═══════════════════════════════════════════════════════════════
-8. CURRENT STRATEGY CONFIG
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+CURRENT STRATEGY CONFIG
+────────────────────────────────────────────
 edge_floor_pp        : {snap.get('edge_floor_pp')}
 no_ask_band          : [{snap.get('no_ask_min')}, {snap.get('no_ask_max')}]
 wide_bracket         : reject if width>{snap.get('wide_bracket_f')}°F AND no_ask<{snap.get('wide_bracket_min_no_ask')}
 flip_threshold       : no_ask >= {snap.get('flip_threshold')} → buy YES
 city_bias_enabled    : {snap.get('city_bias_enabled')}
-city_bias dict:
+city_bias dict (sorted by bias):
 {bias_str}
 
-═══════════════════════════════════════════════════════════════
-9. RECENT COMMITS (last 7 days)
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+RECENT COMMITS (7d)
+────────────────────────────────────────────
 {commits}
 
-═══════════════════════════════════════════════════════════════
-10. CODE EXCERPTS
-═══════════════════════════════════════════════════════════════
+────────────────────────────────────────────
+CODE EXCERPTS (read these before recommending changes)
+────────────────────────────────────────────
 {code_str[:8000]}
 
 ═══════════════════════════════════════════════════════════════
-TASKS
+OUTPUT
 ═══════════════════════════════════════════════════════════════
-
-Output a structured weekly review in this exact format:
-
-A. VERDICT ON PRIOR HYPOTHESES (≤200 words)
-   For each hypothesis from section #5, classify: WORKED / DIDN'T / PARTIAL / TOO_EARLY.
-   For WORKED: extract the lesson — what's now invariant.
-   For DIDN'T: extract why — what was the failure mode.
-
-B. TOP 3 ISSUES with current strategy (≤300 words)
-   Each issue must reference: (a) which section above motivates it, (b) magnitude in $, (c) confidence.
-
-C. PER-CITY STATUS UPDATE (≤200 words)
-   For each city in section #3 with significant change vs prior expectations.
-
-D. RECOMMENDED CHANGES (priority order, ≤500 words)
-   Format each as:
-     N. ★/□  TITLE
-        File: <path>:<line>
-        Change: <concrete diff or new constant value>
-        Risk: low/medium/high
-        Confidence: 0-100%
-        Expected effect: $/wk impact
-        Motivated by: section # above
-        Pre-mortem: "If this fails, why?"
-
-E. ONE COUNTERFACTUAL (≤100 words)
-   "If we had [reverted X / not shipped Y / kept old version], 7d P&L would have been..."
-
-F. ONE NEW UNTRIED HYPOTHESIS (≤100 words)
-   Add to register with rationale.
-
-G. CONFIDENCE CALIBRATION SELF-CHECK (≤100 words)
-   Of past hypotheses with X% confidence, what fraction succeeded?
-   Adjust your confidence here accordingly.
-
-H. RED FLAGS (≤50 words or "none")
-   Anything genuinely concerning.
-
-Constraints:
-- Total ≤2500 words
-- Korean or mixed Korean/English OK
-- Plain text (Telegram doesn't render markdown well)
-- Be ruthless — no hedging
-- Reference specific trade IDs, $ amounts, file:line
-- For each recommendation, the user will reply YES_<num> to ship
-
-Output the review only, no preamble."""
+Output ONLY the 14 messages separated by ---MSG--- on its own line.
+- No preamble, no postamble.
+- No markdown bold (*text*) or italic (_text_) — Telegram parse_mode is "" so it renders literal asterisks. ONLY exception: ```python code fences inside R<n> diff blocks.
+- Korean/English mix OK — professional, mathematical, no casual.
+- Be ruthless. Treat this as if real capital is already deployed; the trader will print this for the desk drawer.
+- Visual hierarchy is binding (emoji semantic anchors, ━ dividers, └├│ sub-bullets, monospace tables with space alignment). Use whitespace for punch.
+- DEPTH > BREVITY. 1500-2500 chars per message is the floor; do not compress for brevity. Show your work."""
 
 
 # ============================================================================
@@ -488,7 +807,11 @@ def call_claude(prompt: str, model: str = "claude-opus-4-6") -> tuple[str, dict]
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model=model,
-        max_tokens=4000,
+        # 16000 output tokens ≈ 22-24K chars across 14 messages.
+        # Empirical: first run at 8000 truncated mid-R1 (pre-mortem failure mode #2).
+        # Cost ceiling: 10K in × $15/M + 16K out × $75/M = ~$1.35 max per run.
+        # × 2 runs/week ≈ $11/month for weekly reviews.
+        max_tokens=16000,
         messages=[{"role": "user", "content": prompt}],
     )
     text = msg.content[0].text
@@ -501,15 +824,28 @@ def call_claude(prompt: str, model: str = "claude-opus-4-6") -> tuple[str, dict]
 
 
 def send_telegram(text: str) -> bool:
+    """Multi-message Telegram send. Splits on the ---MSG--- delimiter so each
+    section lands as its own bubble. Tolerates extra whitespace / dashes.
+    parse_mode="" avoids HTML escape collisions with $ / % / `<` chars.
+    """
+    import re
+    import time
     try:
         sys.path.insert(0, str(ROOT))
         from polymarket_strat.notifications.telegram import TelegramNotifier
         from polymarket_strat.config import TelegramConfig
         cfg = TelegramConfig.from_env()
         notifier = TelegramNotifier(cfg)
-        chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
-        for chunk in chunks:
-            notifier.send_message(chunk, parse_mode="")
+
+        parts = re.split(r"\s*-{3,}\s*MSG\s*-{3,}\s*", text)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if not parts:
+            return False
+
+        for part in parts:
+            for j in range(0, len(part), 3800):
+                notifier.send_message(part[j:j+3800], parse_mode="")
+                time.sleep(0.4)
         return True
     except Exception as e:
         print(f"[strategy_review] Telegram send failed: {e}", file=sys.stderr)
@@ -552,15 +888,31 @@ def main() -> int:
         f"## PROMPT\n\n```\n{prompt}\n```\n\n## RESPONSE\n\n{response}"
     )
 
-    # Telegram message (with header + cost footer)
+    # Parse Claude's structured output into the hypothesis tracker DB.
+    # This closes the J-curve loop — next review's prompt sees its own past
+    # proposals via the DATA section. Failures here are non-fatal: we still
+    # ship to Telegram so the user sees the review even if the parser missed
+    # something, and the response file at REPORT_DIR is the source of truth
+    # for manual replay via `python scripts/parse_review_to_db.py <path>`.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from parse_review_to_db import parse_and_persist
+        parse_result = parse_and_persist(response)
+        print(f"[strategy_review] DB writeback: {parse_result}")
+    except Exception as e:
+        print(f"[strategy_review] parse_and_persist failed: {e}", file=sys.stderr)
+        parse_result = {"error": str(e)}
+
+    # Telegram — header / Claude's multi-part response / footer, each as its own bubble.
     now_kst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%m-%d %H:%M KST")
     cost = (usage["input_tokens"] * 15 + usage["output_tokens"] * 75) / 1_000_000
-    header = f"📈 Weekly Review — {now_kst}\n\n"
-    footer = (f"\n\n— tokens: {usage['input_tokens']} in / "
-              f"{usage['output_tokens']} out, ~${cost:.4f}\n"
-              f"Reply YES_<num> to ship recommendation, NO_<num> to reject.")
+    header = f"📈 STRATEGY REVIEW · {now_kst} · {usage.get('model', 'opus')}"
+    footer = (f"— {usage['input_tokens']} in / {usage['output_tokens']} out · "
+              f"~${cost:.4f}\n"
+              f"Reply: YES_<n> ship · NO_<n> reject · MODIFY_<n> \"<change>\" amend")
 
-    sent = send_telegram(header + response + footer)
+    full_message = f"{header}\n\n---MSG---\n\n{response}\n\n---MSG---\n\n{footer}"
+    sent = send_telegram(full_message)
 
     log_path = LOG_DIR / "strategy_review.log"
     with log_path.open("a") as f:

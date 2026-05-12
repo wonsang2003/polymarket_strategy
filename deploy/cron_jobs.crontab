@@ -54,15 +54,28 @@ TZ=Asia/Seoul
 # so it always has the freshest data (no dependency on walk-forward CSVs).
 35 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/fit_no_isotonic.py >> /home/ubuntu/polymarket/logs/fit_no_isotonic.log 2>&1
 
-# May 3 2026 — AI strategy review automation (Phase 1+2 of self-improving system).
-#   Daily brief : 06:00 KST every day. Sonnet 4.5. ~$0.05/run = $1.50/month.
-#                 Yesterday's data + 1 bias detection + 1 action recommendation.
-#                 Posted to Telegram.
+# May 3-5 2026 — AI strategy review automation (J-curve self-improving system).
+#   Daily brief : 06:00 KST every day. Sonnet 4.5. ~$0.02/run = $0.60/month.
+#                 5-message Telegram brief: HEADLINE / ATTRIBUTION / PATTERN
+#                 WATCH / TODAY'S CALL / ANALYST'S VIEW. Plain text BLUF
+#                 with visual hierarchy (emoji semantic anchors + ━ dividers).
 #   Weekly review: Wed + Sun 09:00 KST. Opus. ~$0.25/run × 2/wk = $2/month.
-#                  7d data + code excerpts + hypothesis tracker + structured
-#                  proposed changes for user reply (YES_<num> / NO_<num>).
+#                  14-message DEPTH-MODE review with hypothesis DAG, full
+#                  code excerpts, mathematical attribution, pre-mortem,
+#                  counterfactual scenarios, calibration self-audit, and
+#                  3-week strategic outlook. Auto-writes proposed R<n> rows
+#                  to strategy_hypotheses (status='proposed') via embedded
+#                  parse_review_to_db so the next cycle sees its own thinking.
 #                  Saves full report to reports/strategy_reviews/.
-# Both fail gracefully — post error to Telegram if API key/credit missing
-# instead of silent failure.
+#   Evaluator   : 05:50 KST every day. Closes the J-curve loop — finds
+#                 shipped hypotheses past their 7d window, computes
+#                 7d-pre vs 7d-post P&L delta, classifies verdict
+#                 (win/partial/lose/inconclusive), updates
+#                 claude_calibration.was_correct. Idempotent. Methodology
+#                 is intentionally blunt (uncontrolled for regime shift /
+#                 cross-rec interaction); it produces SIGNAL, not proof,
+#                 which the next weekly review's Claude weighs explicitly.
+# All three fail gracefully — Telegram error message rather than silent fail.
 0 6 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/daily_brief.py >> /home/ubuntu/polymarket/logs/daily_brief.log 2>&1
 0 9 * * 0,3 cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/strategy_review.py >> /home/ubuntu/polymarket/logs/strategy_review.log 2>&1
+50 5 * * * cd /home/ubuntu/polymarket && /home/ubuntu/polymarket/venv/bin/python scripts/evaluate_hypotheses.py >> /home/ubuntu/polymarket/logs/evaluate_hypotheses.log 2>&1

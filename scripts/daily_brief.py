@@ -269,80 +269,223 @@ def build_prompt(data: dict) -> str:
 
     commits = "\n".join(f"  {c}" for c in (data["recent_commits"] or ["  (no recent commits)"]))
 
-    return f"""You are a quantitative trading analyst reviewing the Polymarket weather alpha system. Write a daily brief based on yesterday's data.
+    return f"""You are a senior quantitative analyst at a top-tier hedge fund — Harvard MBA, ex-Two Sigma. You write the daily brief for the trader running this Polymarket weather alpha. He reads it on his phone in 30 seconds. Every word must earn its place.
 
 ═══════════════════════════════════════════════════════════════
-LIFETIME P&L
+PHILOSOPHY (binding rules)
 ═══════════════════════════════════════════════════════════════
-  Lifetime realized : ${lt.get('net') or 0:+.2f} ({lt.get('n')} settled events)
-  Open positions    : {lt.get('open')} ({ob['count']} total, ${ob['notional']:.2f} notional)
-  Open unrealized   : ${ob['unrealized_pnl']:+.2f}
-  TRUE total        : ${(lt.get('net') or 0) + ob['unrealized_pnl']:+.2f}
+1. BLUF — the FIRST line of every message is the conclusion. Evidence follows.
+2. Quantify or don't claim. Every assertion carries $, %, σ, or n. No "성과가 좋았다" without dollars.
+3. Distinguish skill from luck. With n < 20, flag the noise band: "n=12, ±2σ band ≈ ±$X — inside noise". Don't manufacture patterns from thin data.
+4. Mechanism > outcome. Don't say "London made money" — say "London +$4.10 because fog stickiness held NO bid 0.18 → 0.62 over 6h."
+5. No hedging when data is clear. Explicit hedging when it isn't. No fake humility.
+6. Korean / English mix OK — professional, not casual. Sentences should be tight.
+7. Each message stands alone. No "이제 다음으로" transitions.
 
 ═══════════════════════════════════════════════════════════════
+VISUAL HIERARCHY (binding — phone-readable on first glance)
+═══════════════════════════════════════════════════════════════
+Plain-text only (no markdown bold/italic — Telegram parse_mode is "" so * and _ render literally).
+
+Use Unicode anchors:
+  📊 = scorecard / data        🎯 = attribution / target
+  ⚠️ = warning / pattern        📌 = action / decision
+  🧠 = analyst's interpretation 🔴 = negative number
+  🟢 = positive number          🟡 = neutral / hold
+  🚨 = signal (n × p-value pop)  💀 = biggest loss source
+  📁 = file ref (path:line)    🔁 = trigger / loop condition
+  ⮡ = follow-up / consequence   ◀ ▲ ▼ → = directional
+
+Section divider:  ━━━━━━━━━━━━━━━━━━━━  (20 dashes)
+Sub-bullet structure under a parent line:
+  ├ 1st sub-item
+  ├ 2nd sub-item
+  └ last sub-item
+Indent body content 3 spaces under its emoji-anchored header.
+
+Numbers: use $X.XX format. Right-align inside monospace blocks. Use spaces, not tabs.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — 5 SEPARATE TELEGRAM MESSAGES
+═══════════════════════════════════════════════════════════════
+Output EXACTLY 5 messages, separated by this delimiter on its own line:
+
+---MSG---
+
+Each ≤ 800 chars. Required order (do NOT change):
+
+────────────────────────────────────────────────────────────
+[MSG 1] HEADLINE — pure numbers, zero commentary
+────────────────────────────────────────────────────────────
+Format (use this exact skeleton, fill in numbers):
+
+📊 DAILY · {data['yesterday_kst']} KST
+━━━━━━━━━━━━━━━━━━━━
+
+🔴 −$X.XX   24h realized
+   N trades │ Wn Ln Rn
+   win rate XX%
+
+📈 7d 트렌드 (Nw Nl)
+   {{date}}  {{$X}}
+   {{date}}  {{$X}}
+   ... 7 lines, mark today with ◀
+
+📦 Book
+   N open · $XXX notl
+   Upnl: −$X (cruising N)
+
+────────────────────────────────────────────────────────────
+[MSG 2] ATTRIBUTION — where money came from / went, with MECHANISM
+────────────────────────────────────────────────────────────
+Required structure (3 blocks):
+
+🎯 ATTRIBUTION
+━━━━━━━━━━━━━━━━━━━━
+
+💀 도시 #1   {{city}}  −$X
+   ├ N× settle loss  −$X
+   ├ N× cat_flip     −$X
+   └ city_bias = X.XX (보호 X / 효과)
+
+   ⮡ <one line: cluster context, e.g.
+      "아시아 클러스터가 −$X 중 절반">
+
+💀 카테고리 #1   {{category}}
+   N trades · NW / NL · −$X
+
+   ⮡ <one line: mechanism hypothesis, e.g.
+      "5/5 전패. NO 플립 fade">
+
+🟢 살린 곳
+   {{cat}}    +$X (NW)
+   {{city}}   +$X (이유)
+
+────────────────────────────────────────────────────────────
+[MSG 3] PATTERN WATCH — one signal, n + noise band MANDATORY
+────────────────────────────────────────────────────────────
+⚠️ PATTERN WATCH
+━━━━━━━━━━━━━━━━━━━━
+
+🚨 <pattern title>
+
+   기대 wr ~XX% 였다면
+   {{result}}/{{n}} 확률 ≈ X%  (binomial)
+   → signal / not luck.
+
+🔬 가설
+   <2-3 lines: mechanism>
+
+📁 <file>:<line> ({{symbol}})
+   confidence  XX%
+   sample      n=X (sufficient / 부족)
+   verdict     ship / 보류 · n=N 까지
+
+🟡 (optional) <other observations inside noise>
+   <1-line: "n=X, 2σ band ±$X → noise. Action: 없음">
+
+If n < 20 on every candidate pattern, write
+   "🟡 No tradeable pattern emerged.
+    Largest deviation: <X>, n=N, inside ±2σ band ±$Y."
+and stop. Do NOT manufacture signal.
+
+────────────────────────────────────────────────────────────
+[MSG 4] CALL — one decision, BLUF first line
+────────────────────────────────────────────────────────────
+📌 CALL · <HOLD / SHIP R<n> / DISABLE X>
+━━━━━━━━━━━━━━━━━━━━
+
+⚖ <one-line decision summary>
+
+근거 N개
+   1. <numeric reason>
+   2. <numeric reason>
+   3. <numeric reason>
+
+🔁 트리거 (이거 깨지면 변경)
+   • <metric> <threshold> → <action>
+   • <metric> <threshold> → <action>
+   • <metric> <threshold> → <action>
+
+────────────────────────────────────────────────────────────
+[MSG 5] ANALYST'S VIEW — Claude's interpretation layer
+────────────────────────────────────────────────────────────
+This is your VOICE — what does the senior analyst think AFTER reading the data?
+
+🧠 ANALYST'S VIEW
+━━━━━━━━━━━━━━━━━━━━
+
+📉 <2-3 lines: your read of the situation. Where the
+   distribution shape sits vs lifetime variance.
+   Skew / asymmetry signals.>
+
+🎯 의심 우선순위 (확신 순)
+   ① <hypothesis>
+      <1-line evidence + mechanism>
+   ② <hypothesis>
+      <1-line evidence + mechanism>
+   ③ <hypothesis>
+      <1-line evidence + mechanism>
+
+💡 내가 너라면
+   • <action 1: data collection / wait / etc.>
+   • <action 2: when to revisit, what to ship>
+   • <action 3: phase / capital decision>
+
+🕐 다음 brief 까지 watch
+   ├ <metric 1 to monitor>
+   ├ <metric 2 to monitor>
+   └ <metric 3 to monitor>
+
+═══════════════════════════════════════════════════════════════
+DATA (yesterday = {data['yesterday_kst']} KST)
+═══════════════════════════════════════════════════════════════
+
+LIFETIME
+  Realized      : ${lt.get('net') or 0:+.2f}  (n={lt.get('n')} settled, {lt.get('open')} open)
+  Open notl     : ${ob['notional']:.2f}
+  Open unreal   : ${ob['unrealized_pnl']:+.2f}
+  TRUE total    : ${(lt.get('net') or 0) + ob['unrealized_pnl']:+.2f}
+
 YESTERDAY ({data['yesterday_kst']} KST)
-═══════════════════════════════════════════════════════════════
-  Realized P&L      : ${y.get('net') or 0:+.2f} ({y.get('n')} events)
-  Today so far KST  : ${today.get('net') or 0:+.2f} ({today.get('n')} events)
+  Realized      : ${y.get('net') or 0:+.2f}  (n={y.get('n')})
+  Today so far  : ${today.get('net') or 0:+.2f}  (n={today.get('n')})
 
-  Last 7 days daily:
+7d daily P&L:
 {daily_trend}
 
-═══════════════════════════════════════════════════════════════
-YESTERDAY BY CATEGORY × OUTCOME
-═══════════════════════════════════════════════════════════════
+YESTERDAY × CATEGORY × OUTCOME:
 {cat_lines}
 
-═══════════════════════════════════════════════════════════════
-YESTERDAY BY CITY
-═══════════════════════════════════════════════════════════════
+YESTERDAY × CITY (W=settle win, L=settle loss, R=rebal exit):
 {city_lines}
 
-═══════════════════════════════════════════════════════════════
-YESTERDAY BY EXIT REASON
-═══════════════════════════════════════════════════════════════
+YESTERDAY × EXIT REASON:
 {exit_lines}
 
-═══════════════════════════════════════════════════════════════
-OPEN BOOK STATE
-═══════════════════════════════════════════════════════════════
-  Open positions  : {ob['count']}
-  Cruising (in profit) : {ob['cruising']}
-  Walking-dead (bid<0.10): {ob['walking_dead']}
+OPEN BOOK
+  count={ob['count']}  cruising(upnl>$1)={ob['cruising']}  walking-dead(bid<0.10)={ob['walking_dead']}
 
-═══════════════════════════════════════════════════════════════
-CURRENT STRATEGY SNAPSHOT
-═══════════════════════════════════════════════════════════════
+CURRENT STRATEGY (key constants)
   edge_floor_pp     : {snap.get('edge_floor_pp')}
-  no_ask_band       : [{snap.get('no_ask_min')}, {snap.get('no_ask_max')}]
-  wide_bracket_F    : {snap.get('wide_bracket_f')} (reject if width > X°F + low NO ask)
-  flip_threshold    : {snap.get('flip_threshold')} (no_ask >= X → flip to YES)
-  city_bias_enabled : {snap.get('city_bias_enabled')} ({snap.get('city_bias_count')} cities corrected)
+  no_ask band       : [{snap.get('no_ask_min')}, {snap.get('no_ask_max')}]
+  wide_bracket_F    : {snap.get('wide_bracket_f')}
+  flip_threshold    : {snap.get('flip_threshold')}
+  city_bias_enabled : {snap.get('city_bias_enabled')} ({snap.get('city_bias_count')} cities)
   Sample biases     : {bias_summary}
 
-═══════════════════════════════════════════════════════════════
-RECENT STRATEGY CHANGES (last 2 days)
-═══════════════════════════════════════════════════════════════
+RECENT COMMITS (last 2 days)
 {commits}
 
 ═══════════════════════════════════════════════════════════════
-TASK
+OUTPUT
 ═══════════════════════════════════════════════════════════════
-Write a concise daily brief in Korean (or mixed Korean/English) covering:
-
-1. What happened yesterday (1 paragraph, factual, with $ amounts)
-2. One specific pattern or bias detected (1 paragraph; cite concrete trades or city stats)
-3. One recommended action or "no change needed" with rationale (1 paragraph)
-
-Constraints:
-- Total ≤500 words
-- Direct tone, no hedging, no apologies
-- Reference specific trade IDs, cities, or $ amounts when possible
-- Plain text (no markdown headers — Telegram doesn't render well)
-- If yesterday's P&L was positive, briefly note WHY (which city/strategy drove it)
-- If negative, identify the dominant loss source
-
-Output only the brief, no preamble."""
+Output ONLY the 5 messages separated by ---MSG--- on its own line.
+- No preamble, no postamble.
+- No markdown bold (*text*) or italic (_text_) — Telegram parse_mode is "" so it renders literal asterisks.
+- No code fences except inside [MSG 5] if quoting a code line.
+- Use emoji anchors and ━ dividers as visual punch (NOT decoration — every emoji must have semantic meaning per the legend above).
+- Tight, professional. The trader will glance at this for 30 seconds — make every char earn space."""
 
 
 # ============================================================================
@@ -355,7 +498,7 @@ def call_claude(prompt: str, model: str = "claude-sonnet-4-5") -> tuple[str, dic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model=model,
-        max_tokens=1500,
+        max_tokens=2500,  # 5 messages × ~800 chars × ~0.7 tokens/char ≈ 2,800 tokens headroom
         messages=[{"role": "user", "content": prompt}],
     )
     text = msg.content[0].text
@@ -372,22 +515,35 @@ def call_claude(prompt: str, model: str = "claude-sonnet-4-5") -> tuple[str, dic
 # ============================================================================
 
 def send_telegram(text: str) -> bool:
-    """Send via existing telegram notifier. Chunks if >4000 chars.
+    """Send via existing telegram notifier as MULTIPLE messages.
 
-    Daily-brief output is plain text (no HTML), so we send with parse_mode=None
-    via raw urllib if the existing notifier defaults to HTML escaping.
+    Splits on the ---MSG--- delimiter so each conceptual section lands as
+    its own Telegram message. Each part is then size-chunked (Telegram
+    hard limit ~4096) and sent with a small inter-message delay so the
+    client renders them in order. parse_mode="" avoids HTML escape
+    issues with $/% characters.
+
+    Falls back to single-message send if the delimiter is absent.
     """
+    import re
+    import time
     try:
         sys.path.insert(0, str(ROOT))
         from polymarket_strat.notifications.telegram import TelegramNotifier
         from polymarket_strat.config import TelegramConfig
         cfg = TelegramConfig.from_env()
         notifier = TelegramNotifier(cfg)
-        # Telegram limit ~4096 chars; chunk if longer.
-        # Use parse_mode="" (no HTML) to avoid escape issues with $/% chars.
-        chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
-        for chunk in chunks:
-            notifier.send_message(chunk, parse_mode="")
+
+        # Lenient split — tolerates surrounding whitespace / extra dashes.
+        parts = re.split(r"\s*-{3,}\s*MSG\s*-{3,}\s*", text)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if not parts:
+            return False
+
+        for part in parts:
+            for j in range(0, len(part), 3800):
+                notifier.send_message(part[j:j+3800], parse_mode="")
+                time.sleep(0.4)  # preserve client-side ordering
         return True
     except Exception as e:
         print(f"[daily_brief] Telegram send failed: {e}", file=sys.stderr)
@@ -427,22 +583,26 @@ def main() -> int:
         send_telegram(msg)
         return 1
 
-    # Build final telegram message
+    # Build final telegram message — header + Claude's multi-part response + footer.
+    # Each piece is its own ---MSG--- segment so it lands as a standalone Telegram bubble.
     now_kst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%m-%d %H:%M KST")
     cost_est = (usage["input_tokens"] * 3 + usage["output_tokens"] * 15) / 1_000_000
-    header = f"📊 Daily Brief — {now_kst}\n\n"
-    footer = (f"\n\n— tokens: {usage['input_tokens']} in / "
-              f"{usage['output_tokens']} out, ~${cost_est:.4f}")
+    header = f"📊 DAILY BRIEF · {now_kst}"
+    footer = (f"— {usage['input_tokens']} in / {usage['output_tokens']} out · "
+              f"~${cost_est:.4f} · {usage.get('model', 'sonnet')}")
 
-    sent = send_telegram(header + response + footer)
+    full_message = f"{header}\n\n---MSG---\n\n{response}\n\n---MSG---\n\n{footer}"
+    sent = send_telegram(full_message)
 
-    # Log result
+    # Log result. Full response also dumped to a per-day file for debugging.
     log_path = LOG_DIR / "daily_brief.log"
     with log_path.open("a") as f:
         f.write(f"\n[{datetime.now(timezone.utc).isoformat()}] "
                 f"input={usage['input_tokens']} output={usage['output_tokens']} "
                 f"cost~${cost_est:.4f} sent={sent}\n")
         f.write(response[:500] + "...\n")
+    # Persist FULL response separately so we can audit format / depth.
+    (LOG_DIR / f"daily_brief_response_{datetime.now(timezone.utc):%Y%m%d_%H%M}.txt").write_text(response)
 
     print("Daily brief generated. Tokens:", usage)
     print("Telegram sent:", sent)
