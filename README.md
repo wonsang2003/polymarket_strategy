@@ -1,3 +1,16 @@
+# Polymarket Quantitative Trading Toolkit — 정량 자동매매 시스템
+
+> 작성자: 장원상 (wschang2003@gmail.com)
+
+## 시스템 개요
+
+Polymarket 예측시장의 글로벌 22개 도시 최고기온 베팅을 대상으로 한 자동매매 전략입니다. GFS와 ECMWF 두 기상 모델을 결합한 자체 확률 분포를 계산하고, 이를 시장이 매긴 내재 확률과 비교해 가격 괴리(edge)를 찾아 분기별 Kelly 기준으로 포지션을 산정하는 구조입니다.
+
+핵심 검증 결과 — 시간 순으로 데이터를 흘려가며 검증하는 방식(walk-forward)으로 **22개 도시 × 2개 모델 × 100일치 = 약 4만 건(38,934건)의 예측을 점검**해, 시장 평균 대비 정확도가 의미 있게 높게 나오는 것을 확인했습니다 (Brier Skill Score +0.455).
+---
+
+(아래 영어 본문은 시스템의 기술 구조·전략 디테일·검증 방법·운영 가이드)
+
 # Polymarket Quantitative Trading Toolkit
 
 A multi-strategy Polymarket system. **Weather bracket alpha is the primary strategy** (under validation, paper mode). Legacy whale-following and mispricing strategies live behind the same runtime interface.
